@@ -15,6 +15,11 @@ An MCP (Model Context Protocol) server for **ECHONETLite** home automation — c
 - ❄️ **Full climate control** — mode, fan speed, airflow direction, swing
 - 🔍 **Network device discovery** — find ECHONETLite devices via multicast UDP
 - ⚡ **Real-time notifications** — async updates from device multicast listeners
+- 📖 **MRA enrichment** — Machine Readable Index integration for property names, descriptions, and value decoding
+- 🔬 **EPC introspection** — query property maps (STATMAP/SETMAP/GETMAP) with MRA-based names
+- 🏷️ **Human-readable values** — raw EPC values decoded to human-friendly format using MRA definitions
+- 🎯 **Multi-EPC queries** — query multiple EPC codes in a single request
+- 🔧 **Generic EOJ support** — query any ECHONETLite object by group/class/instance codes
 - 📦 **TypeScript-first** — full type definitions included
 - 🔌 **MCP compatible** — works with any MCP client (Claude Desktop, LM Studio, VS Code extensions, etc.)
 
@@ -168,8 +173,25 @@ Configure in your VS Code MCP extension settings:
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `get_temperatures` | Get room + outdoor temperatures | `host` (optional) |
-| `get_humidity` | Get room humidity | `host` (optional) |
+| `get_temperatures` | Get room + outdoor temperatures | `host` (optional) - IP address |
+| `get_humidity` | Get room humidity | `host` (optional) - IP address |
+
+### EPC Introspection & MRA Lookup
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `get_property_maps` | Query STATMAP/SETMAP/GETMAP with MRA-based property names and descriptions | `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
+| `query_epc` | Query one or more EPC codes from device, returns raw + human-readable decoded values | `epcs` (required), `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
+| `get_epc_definition` | Get MRA definition for EPC codes without querying the device — includes enum values, bitmaps, level ranges | `epcs` (required), `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
+
+### Device Configuration
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `set_swing_mode` | Set air swing/swing mode function | `host`, `mode` ("not-used" / "vert" / "horiz" / "vert-horiz") |
+| `set_auto_direction` | Set automatic airflow direction mode | `host`, `mode` ("auto" / "non-auto" / "auto-vert" / "auto-horiz") |
+| `set_silent_mode` | Set silent operation mode | `host`, `mode` ("normal" / "high-speed" / "silent") |
+| `set_power_saving` | Set power-saving mode | `host`, `state` ("saving" / "normal") |
 
 ## Available Resources
 
@@ -183,11 +205,27 @@ Configure in your VS Code MCP extension settings:
 | EPC | Property | Access | Values |
 |-----|----------|--------|--------|
 | 0x80 | Operation status | Set/Get | 0x30=ON, 0x31=OFF |
-| 0xA0 | Air flow rate | Set/Get | Auto=0x41, Levels=0x31-0x38 |
+| 0x8F | Power-saving operation | Set/Get | Saving/Normal |
+| 0xA0 | Air flow rate (fan speed) | Set/Get | Auto=0x41, Levels=0x31-0x38 |
+| 0xA1 | Automatic airflow direction | Set/Get | Auto/Non-auto/Auto-vert/Auto-horiz |
+| 0xA3 | Air swing mode | Set/Get | Not-used/Vert/Horiz/Vert-horiz |
+| 0xA4 | Airflow direction (vertical) | Set/Get | Upper/Upper-central/Central/Lower-central/Lower |
+| 0xA5 | Airflow direction (horizontal) | Set/Get | 28 positions (rc-right, left-lc, center, etc.) |
 | 0xB0 | Operation mode | Set/Get | Auto=0x41, Cool=0x42, Heat=0x43, Dry=0x44, Fan-only=0x45 |
+| 0xB1 | Automatic temperature control | Set/Get | — |
+| 0xB2 | Normal/High-speed/Silent operation | Set/Get | — |
 | 0xB3 | Set temperature | Set/Get | 0-50°C (signed int) |
+| 0xB4 | Set humidity in dehumidifying mode | Set/Get | — |
+| 0xBA | Room relative humidity | Get | Percentage |
 | 0xBB | Room temperature | Get | -127 to 125°C (signed int) |
-| 0xBE | Outdoor temperature | Get | Signed int |
+| 0xBE | Outdoor air temperature | Get | Signed int |
+| 0xC0 | Ventilation function | Set/Get | — |
+| 0xC1 | Humidifier function | Set/Get | — |
+| 0xCC | Special function setting | Set/Get | Clothes dryer, Mite/mold control, etc. |
+| 0xCF | Air purification mode | Set/Get | — |
+| 0x9D | STATMAP (access capability) | Get | Property access map |
+| 0x9E | SETMAP (settable properties) | Get | Settable property map |
+| 0x9F | GETMAP (readable properties) | Get | Readable property map |
 
 ## Example Prompts
 
@@ -199,18 +237,26 @@ Try these natural language prompts with your MCP client:
 - `"What are the current temperatures?"` → calls `get_temperatures`
 - `"Find all ECHONET devices on my network"` → calls `discover_devices`
 - `"Set fan speed to level 3"` → calls `set_fan_speed` with `speed="level3"`
+- `"What EPC codes can I query on this device?"` → calls `get_property_maps`
+- `"Get the current operation status and target temperature"` → calls `query_epc` with `epcs=["0x80", "0xB3"]`
+- `"What settings are available for operating mode?"` → calls `get_epc_definition` with `epcs=["0xB0"]`
 
 ## Project Structure
 
 ```
 echonetlite-mcp/
 ├── src/
-│   ├── index.ts              # MCP server entry point
-│   ├── echonetlite.ts        # ECHONETLite client wrapper
+│   ├── index.ts              # MCP server entry point & tool definitions
+│   ├── echonetlite.ts        # ECHONETLite client wrapper (UDP communication)
+│   ├── mra.ts                # MRA (Machine Readable Index) data loader & decoders
 │   ├── devices/
-│   │   └── homeAirConditioner.ts  # HVAC device handler
+│   │   └── homeAirConditioner.ts  # HVAC device handler (status, controls, notifications)
 │   ├── types.ts              # TypeScript type definitions
 │   └── config.ts             # Configuration constants
+├── mra/
+│   ├── mraData/              # MRA JSON definition files
+│   ├── COPYRIGHT.txt         # MRA copyright information
+│   └── ReleaseNote_en.md     # MRA release notes
 ├── package.json
 ├── tsconfig.json
 ├── LICENSE
@@ -234,6 +280,16 @@ npm run dev
 # Run the server
 node dist/index.js
 ```
+
+## MRA Integration
+
+This server includes MRA (Machine Readable Index) data for rich property metadata:
+- **Property names & descriptions** — human-readable labels for each EPC code
+- **Value decoding** — raw hex values decoded to meaningful strings/numbers using MRA definitions
+- **Enum/bitmap support** — full enumeration of possible values for settable properties
+- **$ref resolution** — external definition references are resolved automatically
+
+The MRA data enables tools like `query_epc` and `get_epc_definition` to return enriched responses without manual value mapping.
 
 ## References
 
