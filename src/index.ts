@@ -7,7 +7,8 @@ import { z } from 'zod';
 import { EchonetLiteClient } from './echonetlite.js';
 import { HomeAirConditioner } from './devices/homeAirConditioner.js';
 import { DEFAULT_HOST, HVAC_EOJGC, HVAC_EOJCC, HVAC_EOJ_INSTANCE } from './config.js';
-import type { HvacStatus, DiscoveredDevice } from './types.js';
+import type { HvacStatus, DiscoveredDevice, Eoj } from './types.js';
+import { loadMraData, buildEojKey, getEojName } from './mra.js';
 
 // ============================================================================
 // Global State
@@ -442,6 +443,117 @@ server.registerTool(
     } catch (err) {
       return {
         content: [{ type: 'text', text: `Failed to get humidity: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ============================================================================
+/** Query all property maps (STATMAP, SETMAP, GETMAP) of an ECHONETLite object */
+server.registerTool(
+  'get_property_maps',
+  {
+    description: 'Query all property maps (STATMAP/SETMAP/GETMAP) of an ECHONETLite object using standardized EPCs 0x9D, 0x9E, 0x9F. Returns the access capability map (STATMAP), settable properties (SETMAP), and readable properties (GETMAP) with MRA-based property names and descriptions.',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      eojgc: z.string().optional().describe('EOJ Group Code in hex (e.g., "0x01")'),
+      eojcc: z.string().optional().describe('EOJ Class Code in hex (e.g., "0x30")'),
+      eojInstance: z.string().optional().describe('EOJ Instance ID in hex (e.g., "0x01")'),
+    },
+  },
+  async ({ host, eojgc, eojcc, eojInstance }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      
+      // Parse EOJ from hex strings or use default HVAC EOJ
+      const destinationEoj: Eoj = {
+        groupCode: eojgc ? parseInt(eojgc.replace('0x', ''), 16) : 0x01,
+        classCode: eojcc ? parseInt(eojcc.replace('0x', ''), 16) : 0x30,
+        instanceId: eojInstance ? parseInt(eojInstance.replace('0x', ''), 16) : 0x01,
+      };
+
+      const result = await client.getAllPropertyMaps(targetHost, destinationEoj);
+      
+      // Build EOJ key for MRA lookup
+      const eojKey = buildEojKey(destinationEoj.groupCode, destinationEoj.classCode);
+      const eoJName = getEojName(eojKey);
+
+      /**
+       * Parse SETMAP/GETMAP bitmap data using pychonet's _009X format.
+       * Each byte (after the first) represents 8 EPCs as bit flags:
+       * - Byte at index i (code = i-1): bit j → EPC = (j + 8) * 16 + code
+       */
+      const parsePropertyMap = (epcDataItem: { epc: number; pv: Uint8Array }): { epc: string; epcNum: number; name?: string; shortName?: string; description?: string }[] => {
+        if (epcDataItem.pv.length === 0) return [];
+        const bytes = Array.from(epcDataItem.pv);
+        const props: { epc: string; epcNum: number; name?: string; shortName?: string; description?: string }[] = [];
+
+        // If payload is short (< 17 bytes), just return the raw data without first byte
+        if (bytes.length < 17) {
+          for (let i = 1; i < bytes.length; i++) {
+            const epcNum = bytes[i];
+            props.push({ 
+              epc: `0x${epcNum.toString(16).toUpperCase()}`, 
+              epcNum,
+              name: undefined
+            });
+          }
+          return props;
+        }
+
+        // Parse bitmap format (_009X): each byte encodes 8 EPCs
+        for (let i = 1; i < bytes.length; i++) {
+          const code = i - 1;
+          const byteVal = bytes[i];
+          for (let j = 0; j < 8; j++) {
+            if (byteVal & (1 << j)) {
+              const epcNum = (j + 8) * 16 + code;
+              props.push({ 
+                epc: `0x${epcNum.toString(16).toUpperCase()}`, 
+                epcNum,
+                name: undefined
+              });
+            }
+          }
+        }
+
+        // Enrich with MRA property names
+        const mraCache = loadMraData();
+        const lookup = mraCache.get(eojKey);
+        
+        for (const prop of props) {
+          if (lookup) {
+            const propInfo = lookup.properties.get(prop.epcNum);
+            if (propInfo) {
+              prop.name = propInfo.name;
+              prop.shortName = propInfo.shortName;
+              prop.description = propInfo.description;
+            }
+          }
+        }
+
+        return props;
+      };
+
+      // Extract each map by EPC code (0x9d=STATMAP, 0x9e=SETMAP, 0x9f=GETMAP)
+      const statmapData = result.find(r => r.epc === 0x9d);
+      const setmapData = result.find(r => r.epc === 0x9e);
+      const getmapData = result.find(r => r.epc === 0x9f);
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ 
+          eoJ: destinationEoj, 
+          eoJName,
+          statmap: parsePropertyMap(statmapData || { epc: 0x9d, pv: new Uint8Array([]) }),
+          setmap: parsePropertyMap(setmapData || { epc: 0x9e, pv: new Uint8Array([]) }),
+          getmap: parsePropertyMap(getmapData || { epc: 0x9f, pv: new Uint8Array([]) }),
+          description: 'STATMAP(0x9D)=access capability, SETMAP(0x9E)=settable props, GETMAP(0x9F)=readable props. Properties include MRA-based names and decoded values where possible.'
+        }, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Property maps query failed: ${(err as Error).message}` }],
         isError: true,
       };
     }

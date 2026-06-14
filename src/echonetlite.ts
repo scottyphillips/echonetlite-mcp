@@ -471,6 +471,70 @@ export class EchonetLiteClient {
     return response.epcData;
   }
 
+  /**
+   * Parse STATMAP/SETMAP/GETMAP bitmap or raw EPC list data.
+   * First byte is always a count (PDC) of following bytes.
+   * 
+   * For short data (< 17 total bytes including count): raw EPC hex values
+   * For long data (>= 17 total bytes): bitmap format (_009X)
+   *   Each byte represents 8 EPCs: bit j set → EPC = (j + 8) * 16 + code
+   *   where code = byte_index - 1 (low nibble of EPC)
+   */
+  private parsePropertyMapData(data: Uint8Array): { epc: number; ac: number | null }[] {
+    const entries: { epc: number; ac: number | null }[] = [];
+
+    if (data.length < 2) return entries;
+
+    // First byte is count/PDC - skip it
+    const totalBytes = data.length;
+
+    if (totalBytes < 17) {
+      // Short format: each remaining byte IS an EPC value directly
+      for (let i = 1; i < totalBytes; i++) {
+        entries.push({ epc: data[i], ac: null });
+      }
+    } else {
+      // Long bitmap format (_009X): each byte encodes 8 EPCs
+      for (let i = 1; i < totalBytes; i++) {
+        const code = i - 1; // low nibble of EPC
+        const byteVal = data[i];
+        for (let j = 0; j < 8; j++) {
+          if (byteVal & (1 << j)) {
+            const epc = (j + 8) * 16 + code;
+            entries.push({ epc, ac: null });
+          }
+        }
+      }
+    }
+
+    return entries;
+  }
+
+  /**
+   * Query all property maps (STATMAP, SETMAP, GETMAP) of an ECHONETLite object.
+   * Uses standardized EPCs: 0x9D=STATMAP, 0x9E=SETMAP, 0x9F=GETMAP.
+   * Returns parsed property map entries for all three maps in a single request.
+   */
+  async getAllPropertyMaps(
+    host: string,
+    destinationEoj?: Eoj
+  ): Promise<EpcData[]> {
+    const packet: EchonetPacket = {
+      header: { echonetVersion: [0x10, 0x81], tid: 0 },
+      sourceEoj: { groupCode: DEFAULT_SEOJ_GROUP, classCode: DEFAULT_SEOJ_CLASS, instanceId: 0xff },
+      destinationEoj: destinationEoj || { groupCode: 0x01, classCode: 0x30, instanceId: 0x01 },
+      operation: 'get',
+      epcData: [
+        { epc: 0x9d, pv: new Uint8Array([]), ac: 4 },  // STATMAP - access capability map
+        { epc: 0x9e, pv: new Uint8Array([]), ac: 4 },  // SETMAP - settable properties
+        { epc: 0x9f, pv: new Uint8Array([]), ac: 4 },  // GETMAP - readable properties
+      ],
+    };
+
+    const response = await this.sendRequest(host, packet);
+    return response.epcData;
+  }
+
   onNotification(listener: (packet: EchonetPacket, info: { address: string; port: number }) => void): void {
     this.notificationListeners.add(listener);
   }
