@@ -1,0 +1,50 @@
+{
+  "name": "echonetlite-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for ECHONETLite home automation — control air conditioners and read sensors via the Model Context Protocol",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "echonetlite",
+    "mcp",
+    "model-context-protocol",
+    "homeautomation",
+    "iot",
+    "airconditioner",
+    "hvac",
+    "smart-home",
+    "typescript"
+  ],
+  "author": "Scott Phillips <scott@echonetlite.dev>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/scottyphillips/echonetlite-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/scottyphillips/echonetlite-mcp/issues"
+  },
+  "homepage": "https://github.com/scottyphillips/echonetlite-mcp#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3"
+  }
+}

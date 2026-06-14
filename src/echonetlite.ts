@@ -1,0 +1,493 @@
+// ECHONETLite Protocol Client Wrapper
+// Handles UDP communication, binary packet encoding/decoding, and multicast notifications
+
+import dgram from 'node:dgram';
+import {
+  ECHONET_PORT,
+  MULTICAST_ADDRESS,
+  MULTICAST_PORT,
+  DEFAULT_SEOJ_GROUP,
+  DEFAULT_SEOJ_CLASS,
+  REQUEST_TIMEOUT_MS,
+  DISCOVERY_RETRIES,
+  DISCOVERY_INTERVAL_MS,
+} from './config.js';
+import type {
+  EchonetPacket,
+  Eoj,
+  EpcData,
+  DiscoveredDevice,
+} from './types.js';
+
+// ============================================================================
+// Binary Packet Builders / Parsers
+// ============================================================================
+
+/**
+ * Build an ECHONETLite packet buffer for sending.
+ * Format per pychonet buildEchonetMsg:
+ *   [EHD(2)] [TID(2)] [SEOJ(3)] [DEOJ(3)] [ESV(1)] [OPC(1)] [EPC+PDC+EDT...]
+ * 
+ * EHD = 0x1081 (ECHONETLite v1.0, standard frame)
+ * TID = Transaction ID (2 bytes, auto-incrementing per pychonet)
+ * SEOJ = DEFAULT_SEOJ_GROUP/CLASS + packet.sourceEoj.instanceId
+ * DEOJ = Destination EOJ
+ * ESV = Execution Status Value (operation type)
+ * OPC = Operation Data Count (number of EPC entries)
+ */
+let nextTid = 0x0001;
+
+function buildPacketBuffer(packet: EchonetPacket): Buffer {
+  // Calculate EPC data size: for each entry: EPC(1) + PDC(1) + PV(pv.length)
+  const epcDataSize = packet.epcData.reduce((sum, e) => sum + 2 + e.pv.length, 0);
+
+  // Header: EHD(2) + TID(2) + srcEOJ(3) + dstEOJ(3) + esv(1) + opc(1) = 12
+  const headerSize = 12;
+  const totalSize = headerSize + epcDataSize;
+  const buffer = Buffer.alloc(totalSize);
+  let offset = 0;
+
+  // EHD (Header): 0x10 0x81
+  buffer.writeUInt8(0x10, offset++);
+  buffer.writeUInt8(0x81, offset++);
+
+  // Transaction ID (TID) - 2 bytes big-endian, auto-incrementing per pychonet spec
+  const tid = nextTid++;
+  if (nextTid > 0xFFFF) nextTid = 0x0001;
+  buffer.writeUInt16BE(tid, offset);
+  offset += 2;
+
+  // Source EOJ (SEOJ - 3 bytes): pychonet default group/class + packet's instance
+  buffer.writeUInt8(DEFAULT_SEOJ_GROUP, offset++);
+  buffer.writeUInt8(DEFAULT_SEOJ_CLASS, offset++);
+  buffer.writeUInt8(packet.sourceEoj.instanceId, offset++);
+
+  // Destination EOJ (DEOJ - 3 bytes)
+  buffer.writeUInt8(packet.destinationEoj.groupCode, offset++);
+  buffer.writeUInt8(packet.destinationEoj.classCode, offset++);
+  buffer.writeUInt8(packet.destinationEoj.instanceId, offset++);
+
+  // ESV (Execution Status Value) - operation type per pychonet spec
+  // GET=0x62, SETC/SET=0x61, SETI_SNA=0x50, GET_SNA=0x52, etc.
+  const esvMap: Record<string, number> = { 
+    get: 0x62, set: 0x61, getmap: 0x63, infreq: 0x63,
+    getres: 0x72, setres: 0x71, seti: 0x50, setc: 0x61,
+    inf: 0x73, infc: 0x74, setget: 0x6e, instance_list: 0xd6,
+    // SNA (Sequence Number Ack) response codes
+    get_sna: 0x52, setc_snd: 0x51, inf_sna: 0x53,
+    setget_res: 0x7e, infc_res: 0x7a, seti_sna: 0x50,
+  };
+  buffer.writeUInt8(esvMap[packet.operation] || 0x02, offset++);
+
+  // OPC (Operation Data Count) - number of EPC entries
+  buffer.writeUInt8(packet.epcData.length, offset++);
+
+  // EPC data items: [EPC(1) + PDC(n) + EDT(PDC bytes)]...
+  for (const epc of packet.epcData) {
+    buffer.writeUInt8(epc.epc, offset++);
+    const pdc = epc.pv.length;
+    buffer.writeUInt8(pdc, offset++); // PDC = number of PV/EDT bytes
+    if (pdc > 0) {
+      buffer.set(epc.pv, offset);
+      offset += pdc;
+    }
+  }
+
+  return buffer;
+}
+
+/**
+ * Parse an ECHONETLite packet from a Buffer.
+ * Format per pychonet:
+ *   [EHD(2)] [TID(2)] [SEOJ(3)] [DEOJ(3)] [ESV(1)] [OPC(1)] [EPC+PDC+EDT...]
+ */
+function parsePacket(buffer: Buffer): EchonetPacket | null {
+  // Minimum size: EHD(2) + TID(2) + SEOJ(3) + DEOJ(3) + ESV(1) + OPC(1) = 12
+  if (buffer.length < 12) return null;
+
+  let offset = 0;
+
+  // EHD (Header): validate ECHONETLite format
+  const ehd1 = buffer.readUInt8(offset++); // Version byte: should be 0x10
+  const ehd2 = buffer.readUInt8(offset++); // Frame format byte: should be 0x81
+
+  if (ehd1 !== 0x10) return null; // Only support ECHONET Lite v1.x
+  if (ehd2 !== 0x81) return null; // Standard frame format required
+
+  // Transaction ID (TID) - 2 bytes big-endian (NOT a timestamp!)
+  const tid = buffer.readUInt16BE(offset);
+  offset += 2;
+
+  // Source EOJ (SEOJ - 3 bytes: groupCode, classCode, instanceId)
+  const sourceEoj: Eoj = {
+    groupCode: buffer.readUInt8(offset++),
+    classCode: buffer.readUInt8(offset++),
+    instanceId: buffer.readUInt8(offset++),
+  };
+
+  // Destination EOJ (DEOJ - 3 bytes)
+  const destinationEoj: Eoj = {
+    groupCode: buffer.readUInt8(offset++),
+    classCode: buffer.readUInt8(offset++),
+    instanceId: buffer.readUInt8(offset++),
+  };
+
+  // ESV (Execution Status Value) - identifies request type AND response type
+  const esv = buffer.readUInt8(offset++);
+
+  // Map ESV to operation string (both requests and responses) per pychonet spec
+  // Full ESV table from pychonet echonetlite.py:
+  const allMap: Record<number, string> = {
+    // Request codes
+    0x62: 'get',       // GET
+    0x61: 'setc',      // SETC (Set with response)
+    0x63: 'infreq',    // INFREQ
+    0x6e: 'setget',    // SETGET
+    0xd6: 'instance_list',  // INSTANCE_LIST
+    // Response codes (SNA - Sequence Number Ack)
+    0x52: 'get_sna',   // GET_SNA — ack for SETC/GET requests
+    0x51: 'setc_snd',  // SETC_SND
+    0x53: 'inf_sna',   // INF_SNA
+    0x5e: 'setget_res',// SETGET_RES
+    0x7a: 'infc_res',  // INFC_RES
+    0x50: 'seti_sna',  // SETI_SNA
+    // Execution response codes
+    0x71: 'setres',    // SETRES (Set response)
+    0x72: 'getres',    // GETRES (Get response)
+    0x73: 'inf',       // INF (Notification)
+    0x74: 'infc',      // INFC (Notification confirm)
+    // Deprecated/alias codes
+    0x65: 'seti',      // SETI (deprecated, use seti_sna)
+    0x60: 'seti',      // GETC/SETI (deprecated)
+    // Error response codes
+    0x64: 'access_denied', 0x66: 'not_supported', 0x67: 'error',
+    0x75: 'setres_error',
+  };
+  const opStr = allMap[esv];
+  if (!opStr) {
+    console.error(`parsePacket: Unknown ESV=0x${esv.toString(16)}, buffer length=${buffer.length}`);
+    return null;
+  }
+
+  // OPC (Operation Data Count) - number of EPC entries
+  const epcCount = buffer.readUInt8(offset++);
+
+  // Parse EPC data items with proper PDC-based length reading
+  const epcData: EpcData[] = [];
+  for (let i = 0; i < epcCount && offset < buffer.length; i++) {
+    const epc = buffer.readUInt8(offset++);
+
+    // Read PDC (Property Data Count) - number of bytes following
+    let pdc = 0;
+    if (offset < buffer.length) {
+      pdc = buffer.readUInt8(offset++);
+    }
+
+    // Read EDT/EVD data
+    const pvLen = Math.max(0, Math.min(pdc, buffer.length - offset));
+    const pv = buffer.subarray(offset, offset + pvLen);
+    offset += pvLen;
+
+    epcData.push({ epc, pv, ac: pdc });
+  }
+
+  return {
+    header: { echonetVersion: [ehd1, ehd2], tid },
+    sourceEoj,
+    destinationEoj,
+    operation: opStr as any,
+    epcData,
+    esv: esv,
+  };
+}
+
+// ============================================================================
+// Value Encoders/Decoders for specific EPC types
+// ============================================================================
+
+export function encodeUChar(value: number): Uint8Array {
+  return new Uint8Array([value & 0xff]);
+}
+
+export function encodeSChar(value: number): Uint8Array {
+  const clamped = Math.max(-127, Math.min(127, value));
+  return new Uint8Array([(clamped < 0 ? clamped + 256 : clamped) & 0xff]);
+}
+
+export function encodeUInt16(value: number): Uint8Array {
+  const buf = Buffer.alloc(2);
+  buf.writeUInt16BE(value, 0);
+  return new Uint8Array(buf);
+}
+
+export function encodeSInt16(value: number): Uint8Array {
+  const buf = Buffer.alloc(2);
+  buf.writeInt16BE(value, 0);
+  return new Uint8Array(buf);
+}
+
+export function decodeUChar(pv: Uint8Array): number {
+  return pv.length > 0 ? pv[0] : 0;
+}
+
+export function decodeSChar(pv: Uint8Array): number {
+  if (pv.length === 0) return 0;
+  const val = pv[0];
+  return val > 127 ? val - 256 : val;
+}
+
+export function decodeUInt16(pv: Uint8Array): number {
+  if (pv.length < 2) return 0;
+  return (pv[0] << 8) | pv[1];
+}
+
+export function decodeSInt16(pv: Uint8Array): number {
+  if (pv.length < 2) return 0;
+  const buf = Buffer.from(pv);
+  return buf.readInt16BE(0);
+}
+
+// ============================================================================
+// ECHONETLite Client Class
+// ============================================================================
+
+interface PendingRequest {
+  resolve: (value: EchonetPacket) => void;
+  reject: (reason: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+export class EchonetLiteClient {
+  private udpSocket: dgram.Socket | null = null;
+  // Match responses by TID + source address (each request gets unique TID)
+  private pendingRequests: Map<string, PendingRequest> = new Map();
+  private notificationListeners: Set<(packet: EchonetPacket, info: { address: string; port: number }) => void> = new Set();
+
+  initialize(): void {
+    this.udpSocket = dgram.createSocket('udp4');
+
+    // Bind with SO_REUSEADDR to allow sharing port with pychonet
+    this.udpSocket.bind({
+      port: ECHONET_PORT,
+      address: '192.168.1.5',
+      exclusive: false
+    }, () => {
+      console.error(`ECHONETLite client: Socket bound to 192.168.1.5:${ECHONET_PORT}`);
+
+      if (this.udpSocket) {
+        this.udpSocket.addMembership(MULTICAST_ADDRESS, '192.168.1.5');
+        console.error(`ECHONETLite client: Joined multicast group ${MULTICAST_ADDRESS}`);
+      }
+    });
+
+    this.udpSocket.on('message', (message: Buffer, rinfo: dgram.RemoteInfo) => {
+      this.handleIncomingMessage(message, rinfo.address, rinfo.port);
+    });
+
+    this.udpSocket.on('error', (err: Error) => {
+      console.error(`ECHONETLite client: Socket error: ${err.message}`);
+      this.rejectAllRequests(new Error(`Socket error: ${err.message}`));
+    });
+  }
+
+  private handleIncomingMessage(message: Buffer, address: string, port: number): void {
+    const packet = parsePacket(message);
+    if (!packet) {
+      console.error(`ECHONETLite client: Received invalid packet from ${address}:${port}`);
+      return;
+    }
+
+    // Match response by TID + source address
+    const requestId = `${packet.header.tid}:${address}`;
+    const pending = this.pendingRequests.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingRequests.delete(requestId);
+      pending.resolve(packet);
+      return;
+    }
+
+    // Notify listeners of unsolicited notifications
+    for (const listener of this.notificationListeners) {
+      try {
+        listener(packet, { address, port });
+      } catch (err) {
+        console.error(`ECHONETLite client: Notification listener error: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  private rejectAllRequests(reason: Error): void {
+    for (const pending of this.pendingRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(reason);
+    }
+    this.pendingRequests.clear();
+  }
+
+  async sendRequest(
+    targetHost: string,
+    packet: EchonetPacket,
+    timeoutMs: number = REQUEST_TIMEOUT_MS
+  ): Promise<EchonetPacket> {
+    return new Promise((resolve, reject) => {
+      if (!this.udpSocket) {
+        reject(new Error('ECHONETLite client not initialized'));
+        return;
+      }
+
+      const buffer = buildPacketBuffer(packet);
+      
+      // Extract the TID we just wrote for matching responses
+      const tid = buffer.readUInt16BE(2);
+      
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(requestKey);
+        reject(new Error(`ECHONETLite request timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      // Match by TID + target host address
+      const requestKey = `${tid}:${targetHost}`;
+      this.pendingRequests.set(requestKey, { resolve, reject, timer });
+
+      this.udpSocket.send(buffer, 0, buffer.length, ECHONET_PORT, targetHost, (err) => {
+        if (err) {
+          this.pendingRequests.delete(requestKey);
+          clearTimeout(timer);
+          reject(new Error(`ECHONETLite send error: ${err.message}`));
+        }
+      });
+    });
+  }
+
+  async discoverDevices(timeoutMs: number = DISCOVERY_INTERVAL_MS * DISCOVERY_RETRIES + 1000): Promise<DiscoveredDevice[]> {
+    if (!this.udpSocket) {
+      throw new Error('ECHONETLite client not initialized');
+    }
+
+    const discovered: DiscoveredDevice[] = [];
+    const seenHosts = new Set<string>();
+
+    const discoverListener = (packet: EchonetPacket, info: { address: string; port: number }) => {
+      const host = info.address;
+      if (!seenHosts.has(host)) {
+        seenHosts.add(host);
+        discovered.push({
+          host,
+          eoj: packet.sourceEoj,
+          timestamp: new Date(),
+        });
+      }
+    };
+
+    this.notificationListeners.add(discoverListener);
+
+    // Discovery request to multicast
+    const discoverPacket: EchonetPacket = {
+      header: { echonetVersion: [0x10, 0x81], tid: 0 },
+      sourceEoj: { groupCode: DEFAULT_SEOJ_GROUP, classCode: DEFAULT_SEOJ_CLASS, instanceId: 0xff },
+      destinationEoj: { groupCode: 0x01, classCode: 0x30, instanceId: 0x01 },
+      operation: 'get',
+      epcData: [{ epc: 0xe0, pv: new Uint8Array([0x01]), ac: 4 }],
+    };
+
+    const buffer = buildPacketBuffer(discoverPacket);
+
+    for (let i = 0; i < DISCOVERY_RETRIES; i++) {
+      await new Promise<void>((resolve) => {
+        this.udpSocket!.send(buffer, 0, buffer.length, MULTICAST_PORT, MULTICAST_ADDRESS, () => {
+          resolve();
+        });
+      });
+      if (i < DISCOVERY_RETRIES - 1) {
+        await new Promise(resolve => setTimeout(resolve, DISCOVERY_INTERVAL_MS));
+      }
+    }
+
+    // Also send to broadcast
+    const broadcastBuffer = buildPacketBuffer({
+      ...discoverPacket,
+      destinationEoj: { groupCode: 0x01, classCode: 0xff, instanceId: 0xff },
+    });
+
+    await new Promise<void>((resolve) => {
+      this.udpSocket!.send(broadcastBuffer, 0, broadcastBuffer.length, ECHONET_PORT, '255.255.255.255', () => {
+        resolve();
+      });
+    });
+
+    await new Promise(resolve => setTimeout(resolve, timeoutMs));
+
+    this.notificationListeners.delete(discoverListener);
+    return discovered;
+  }
+
+  async get(
+    host: string,
+    epcCodes: number[],
+    destinationEoj?: Eoj
+  ): Promise<EpcData[]> {
+    const packet: EchonetPacket = {
+      header: { echonetVersion: [0x10, 0x81], tid: 0 },
+      sourceEoj: { groupCode: DEFAULT_SEOJ_GROUP, classCode: DEFAULT_SEOJ_CLASS, instanceId: 0xff },
+      destinationEoj: destinationEoj || { groupCode: 0x01, classCode: 0x30, instanceId: 0x01 },
+      operation: 'get',
+      epcData: epcCodes.map(epc => ({ epc, pv: new Uint8Array([]), ac: 4 })),
+    };
+
+    const response = await this.sendRequest(host, packet);
+    return response.epcData.filter(e => epcCodes.includes(e.epc));
+  }
+
+  async set(
+    host: string,
+    epcDataItems: { epc: number; pv: Uint8Array }[],
+    destinationEoj?: Eoj
+  ): Promise<void> {
+    const packet: EchonetPacket = {
+      header: { echonetVersion: [0x10, 0x81], tid: 0 },
+      sourceEoj: { groupCode: DEFAULT_SEOJ_GROUP, classCode: DEFAULT_SEOJ_CLASS, instanceId: 0xff },
+      destinationEoj: destinationEoj || { groupCode: 0x01, classCode: 0x30, instanceId: 0x01 },
+      operation: 'set',
+      epcData: epcDataItems.map(item => ({ ...item, ac: 4 })),
+    };
+
+    await this.sendRequest(host, packet);
+  }
+
+  async getmap(
+    host: string,
+    destinationEoj?: Eoj
+  ): Promise<EpcData[]> {
+    const packet: EchonetPacket = {
+      header: { echonetVersion: [0x10, 0x81], tid: 0 },
+      sourceEoj: { groupCode: DEFAULT_SEOJ_GROUP, classCode: DEFAULT_SEOJ_CLASS, instanceId: 0xff },
+      destinationEoj: destinationEoj || { groupCode: 0x01, classCode: 0x30, instanceId: 0x01 },
+      operation: 'getmap',
+      epcData: [{ epc: 0xe0, pv: new Uint8Array([0x01]), ac: 4 }],
+    };
+
+    const response = await this.sendRequest(host, packet);
+    return response.epcData;
+  }
+
+  onNotification(listener: (packet: EchonetPacket, info: { address: string; port: number }) => void): void {
+    this.notificationListeners.add(listener);
+  }
+
+  offNotification(listener: (packet: EchonetPacket, info: { address: string; port: number }) => void): void {
+    this.notificationListeners.delete(listener);
+  }
+
+  destroy(): void {
+    if (this.udpSocket) {
+      this.udpSocket.dropMembership(MULTICAST_ADDRESS);
+      this.udpSocket.close();
+      this.udpSocket = null;
+    }
+    this.rejectAllRequests(new Error('Client destroyed'));
+  }
+}
+
+// Re-export types
+export type { EchonetPacket, Eoj, EpcData, DiscoveredDevice };

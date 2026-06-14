@@ -1,0 +1,564 @@
+// ECHONETLite MCP Server
+// Main entry point - creates the MCP server with tools and resources for HVAC control
+
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import { EchonetLiteClient } from './echonetlite.js';
+import { HomeAirConditioner } from './devices/homeAirConditioner.js';
+import { DEFAULT_HOST, HVAC_EOJGC, HVAC_EOJCC, HVAC_EOJ_INSTANCE } from './config.js';
+import type { HvacStatus, DiscoveredDevice } from './types.js';
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+const client = new EchonetLiteClient();
+let hvac: HomeAirConditioner | null = null;
+let cachedStatus: HvacStatus | null = null;
+
+// ============================================================================
+// MCP Server Definition
+// ============================================================================
+
+const server = new McpServer({
+  name: 'echonetlite-mcp',
+  version: '1.0.0',
+});
+
+// ============================================================================
+// Tool Definitions
+// ============================================================================
+
+/** Discover all ECHONETLite devices on the network */
+server.registerTool(
+  'discover_devices',
+  {
+    description: 'Discover all ECHONETLite devices on the local network via multicast',
+    inputSchema: {
+      timeout: z.number().optional().describe('Discovery timeout in milliseconds (default: 3000)'),
+    },
+  },
+  async ({ timeout }) => {
+    try {
+      const devices = await client.discoverDevices(timeout || 3000);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify(devices.map(d => ({
+            host: d.host,
+            eojgc: `0x${d.eoj.groupCode.toString(16)}`,
+            eojcc: `0x${d.eoj.classCode.toString(16)}`,
+            eojInstance: `0x${d.eoj.instanceId.toString(16)}`,
+          })), null, 2),
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Discovery failed: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Get full status of the HVAC device */
+server.registerTool(
+  'get_device_status',
+  {
+    description: 'Get full status of the home air conditioner device',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+    },
+  },
+  async ({ host }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      const status = await tempHvac.getFullStatus();
+      cachedStatus = status;
+
+      // Operation status is already converted to "ON"/"OFF" by HomeAirConditioner
+      const formatted = { ...status };
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to get status: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Turn HVAC on or off */
+server.registerTool(
+  'set_operation',
+  {
+    description: 'Turn the home air conditioner ON or OFF',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      operation: z.enum(['on', 'off']).describe('Operation: "on" or "off"'),
+    },
+  },
+  async ({ host, operation }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setOperation(operation === 'on');
+
+      // Refresh cached status
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `HVAC operation set to ${operation.toUpperCase()}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set operation: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set operating mode */
+server.registerTool(
+  'set_operating_mode',
+  {
+    description: 'Set the HVAC operating mode (auto, cool, heat, dry, fan_only)',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      mode: z.enum(['auto', 'cool', 'heat', 'dry', 'fan_only']).describe('Operating mode'),
+    },
+  },
+  async ({ host, mode }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setOperatingMode(mode);
+
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `HVAC mode set to ${mode}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set mode: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set target temperature */
+server.registerTool(
+  'set_temperature',
+  {
+    description: 'Set the target temperature (0-50°C)',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      temperature: z.number().min(0).max(50).describe('Target temperature in °C (0-50)'),
+    },
+  },
+  async ({ host, temperature }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setTemperature(temperature);
+
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `Temperature set to ${temperature}°C` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set temperature: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set fan speed */
+server.registerTool(
+  'set_fan_speed',
+  {
+    description: 'Set the air flow rate (fan speed)',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      speed: z.enum(['auto', 'level1', 'level2', 'level3', 'level4', 'level5', 'level6', 'level7', 'level8']).describe('Fan speed'),
+    },
+  },
+  async ({ host, speed }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setFanSpeed(speed);
+
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `Fan speed set to ${speed}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set fan speed: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set vertical airflow position */
+server.registerTool(
+  'set_airflow_vertical',
+  {
+    description: 'Set the vertical vane/airflow position',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      position: z.enum(['upper', 'upper-central', 'central', 'lower-central', 'lower']).describe('Vertical position'),
+    },
+  },
+  async ({ host, position }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setAirflowVertical(position);
+
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `Vertical airflow set to ${position}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set vertical airflow: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set horizontal airflow position */
+server.registerTool(
+  'set_airflow_horizontal',
+  {
+    description: 'Set the horizontal vane/airflow position (28 positions available)',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      position: z.enum(['rc-right', 'left-lc', 'lc-center-rc', 'left-lc-rc-right', 'right', 'rc', 'center', 'center-right', 'center-rc', 'center-rc-right', 'lc', 'lc-right', 'lc-rc', 'lc-rc-right', 'lc-center', 'lc-center-right', 'lc-center-rc-right', 'left', 'left-right', 'left-rc', 'left-rc-right', 'left-center', 'left-center-right', 'left-center-rc', 'left-center-rc-right', 'left-lc-right', 'left-lc-rc']).describe('Horizontal position'),
+    },
+  },
+  async ({ host, position }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setAirflowHorizontal(position);
+
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `Horizontal airflow set to ${position}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set horizontal airflow: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set swing mode */
+server.registerTool(
+  'set_swing_mode',
+  {
+    description: 'Set the air swing/swing mode function',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      mode: z.enum(['not-used', 'vert', 'horiz', 'vert-horiz']).describe('Swing mode'),
+    },
+  },
+  async ({ host, mode }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setSwingMode(mode);
+
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `Swing mode set to ${mode}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set swing mode: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set automatic direction mode */
+server.registerTool(
+  'set_auto_direction',
+  {
+    description: 'Set the automatic airflow direction mode',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      mode: z.enum(['auto', 'non-auto', 'auto-vert', 'auto-horiz']).describe('Auto direction mode'),
+    },
+  },
+  async ({ host, mode }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setAutoDirection(mode);
+
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `Auto direction set to ${mode}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set auto direction: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set silent mode */
+server.registerTool(
+  'set_silent_mode',
+  {
+    description: 'Set the silent operation mode',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      mode: z.enum(['normal', 'high-speed', 'silent']).describe('Silent mode'),
+    },
+  },
+  async ({ host, mode }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setSilentMode(mode);
+
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `Silent mode set to ${mode}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set silent mode: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set power-saving mode */
+server.registerTool(
+  'set_power_saving',
+  {
+    description: 'Set the power-saving operation mode',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      state: z.enum(['saving', 'normal']).describe('Power saving state'),
+    },
+  },
+  async ({ host, state }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      await tempHvac.setPowerSaving(state);
+
+      cachedStatus = await tempHvac.getFullStatus();
+
+      return {
+        content: [{ type: 'text', text: `Power saving set to ${state}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set power saving: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Get room and outdoor temperatures */
+server.registerTool(
+  'get_temperatures',
+  {
+    description: 'Get both room temperature and outdoor temperature readings',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+    },
+  },
+  async ({ host }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      const temps = await tempHvac.getTemperatures();
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ room: temps.room, outdoor: temps.outdoor }, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to get temperatures: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Get room humidity */
+server.registerTool(
+  'get_humidity',
+  {
+    description: 'Get the current room relative humidity reading',
+    inputSchema: {
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+    },
+  },
+  async ({ host }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      const humidity = await tempHvac.getHumidity();
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ humidity }, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to get humidity: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ============================================================================
+// Resource Definitions
+// ============================================================================
+
+/** Device status resource - updated via async notifications */
+server.registerResource(
+  'device://status',
+  'device://status',
+  {},
+  async () => {
+    const status = cachedStatus || await (hvac?.getFullStatus());
+    if (!status) {
+      return {
+        contents: [{
+          uri: 'device://status',
+          mimeType: 'application/json',
+          text: JSON.stringify({ error: 'No status available. Device may be unreachable.' }, null, 2),
+        }],
+      };
+    }
+
+    // Operation status is already "ON"/"OFF" from HomeAirConditioner.parseEpcData
+    const formatted = { ...status };
+
+    return {
+      contents: [{
+        uri: 'device://status',
+        mimeType: 'application/json',
+        text: JSON.stringify(formatted, null, 2),
+      }],
+    };
+  }
+);
+
+/** Device capabilities resource */
+server.registerResource(
+  'device://capabilities',
+  'device://capabilities',
+  {},
+  async () => {
+    try {
+      const targetHost = hvac?.getHost() || DEFAULT_HOST;
+      const tempHvac = new HomeAirConditioner(client, targetHost);
+      const capabilities = await tempHvac.getCapabilities();
+
+      return {
+        contents: [{
+          uri: 'device://capabilities',
+          mimeType: 'application/json',
+          text: JSON.stringify(capabilities.map(c => ({
+            epc: `0x${c.epc.toString(16).toUpperCase()}`,
+            ac: c.ac,
+          })), null, 2),
+        }],
+      };
+    } catch (err) {
+      return {
+        contents: [{
+          uri: 'device://capabilities',
+          mimeType: 'application/json',
+          text: JSON.stringify({ error: `Failed to get capabilities: ${(err as Error).message}` }, null, 2),
+        }],
+      };
+    }
+  }
+);
+
+// ============================================================================
+// Notification Listener for Real-Time Updates
+// ============================================================================
+
+function setupNotificationListener(): void {
+  client.onNotification((packet, info) => {
+    // Check if this is from our HVAC device (EOJGC=0x01, EOJCC=0x30)
+    if (packet.sourceEoj.groupCode === HVAC_EOJGC && packet.sourceEoj.classCode === HVAC_EOJCC) {
+      const tempHvac = new HomeAirConditioner(client, info.address);
+      tempHvac.updateFromNotification(packet);
+
+      // Update cached status and notify MCP clients of resource change
+      cachedStatus = tempHvac.getStatus();
+    }
+  });
+}
+
+// ============================================================================
+// Server Startup
+// ============================================================================
+
+async function main() {
+  // Initialize the ECHONETLite client (creates UDP sockets)
+  client.initialize();
+
+  // Create default HVAC handler
+  hvac = new HomeAirConditioner(client, DEFAULT_HOST);
+
+  // Set up notification listener for real-time updates
+  setupNotificationListener();
+
+  console.error(`ECHONETLite MCP Server starting...`);
+  console.error(`Default host: ${DEFAULT_HOST}`);
+  console.error(`UDP port: 3610`);
+  console.error(`Multicast: 224.0.23.0:3610`);
+
+  // Connect via stdio transport
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+
+  console.error('ECHONETLite MCP Server running on stdio');
+}
+
+main().catch((err) => {
+  console.error(`Fatal error: ${err.message}`);
+  process.exit(1);
+});
