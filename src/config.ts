@@ -60,3 +60,46 @@ export const DISCOVERY_RETRIES = 3;
  * Discovery request interval in milliseconds
  */
 export const DISCOVERY_INTERVAL_MS = 500;
+
+// ============================================================================
+// ECHONETLite Node Profile Class EPC Codes (for device discovery)
+// ============================================================================
+
+/**
+ * These EPC codes are used in the Node Profile Class (0x0E 0xF0 xx) 
+ * to discover device metadata during active discovery probes.
+ * Based on pychonet ENL_* constants:
+ */
+
+/** Instance List Notification (EPC 0xD6) — Configuration of instances at startup */
+export const EPC_INSTANCE_LIST = 0xd6;
+
+/** Unique ID (EPC 0x83) - Device unique identifier */
+export const EPC_UID = 0x83;
+
+/** Name (EPC 0xFB) - Device name */
+export const EPC_NAME = 0xfb;
+
+/** Date of Manufacture (EPC 0xFA) - Manufacturing date */
+export const EPC_DATE_OF_MANUFACTURE = 0xfa;
+
+/** Manufacturer (EPC 0x8A) - Device manufacturer */
+export const EPC_MANUFACTURER = 0x8a;
+
+/** ECOI (EPC 0x8C) - Extended Class Definition (Product Code) */
+export const EPC_ECOI = 0x8c;
+
+/**
+ * Node Profile Class Group/Class codes for discovery.
+ * SEOJ = 0x0E (Node Profile group), ESV = 0xF0 (Response), EOC = instance
+ */
+export const NODE_PROFILE_GROUP = 0x0e;
+export const NODE_PROFILE_CLASS = 0xf0;
+
+/**
+ * Default broadcast/multicast destination for discovery.
+ * Uses the ECHONETLite default device class group (0x01 0x30 ff) 
+ * and broadcast (0x01 0xff ff) for maximum reach.
+ */
+export const DISCOVERY_MULTICAST_ADDRESS = '224.0.23.0';
+export const DISCOVERY_BROADCAST_ADDRESS = '255.255.255.255';

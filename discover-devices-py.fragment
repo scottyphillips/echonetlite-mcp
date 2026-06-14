@@ -1,0 +1,281 @@
+  async def discover(
+        self,
+        host: str = ENL_MULTICAST_ADDRESS,
+    ) -> bool:
+        """Discover devices on the network.
+
+        Args:
+            host: Host to discover (default: multicast address)
+
+        Returns:
+            True if message was successful, False otherwise
+        """
+        if host is ENL_MULTICAST_ADDRESS:
+            opc = [{"EPC": INSTANCE_LIST}]
+        else:
+            opc = [
+                {"EPC": ENL_MANUFACTURER},
+                {"EPC": ENL_PRODUCT_CODE},
+                {"EPC": ENL_UID},
+                {"EPC": INSTANCE_LIST},
+            ]
+        return await self.echonetMessage(host, 0x0E, 0xF0, 0x01, GET, opc)
+
+
+
+    async def echonetMessageReceived(
+        self,
+        raw_data: bytes,
+        addr: Tuple[str, int],
+    ) -> None:
+        """Handle incoming ECHONET messages.
+
+        Args:
+            raw_data: Raw bytes of the received message
+            addr: Tuple of (host IP, port) from the sender
+        """
+        updated = False
+        host = addr[0]
+        is_discovery = False
+
+        if host in self._server._multicast_ips:
+            return
+
+        if self._debug_flag:
+            self._logger(
+                f"ECHONETLite Message Received from {host} - Raw data is {raw_data}"
+            )
+
+        try:
+            processed_data = decodeEchonetMsg(raw_data)
+        except Exception as err:
+            if self._debug_flag:
+                self._logger(
+                    f"Failed to decode ECHONETLite packet from {host}: {err}, raw={raw_data}"
+                )
+            return
+
+        if self._debug_flag:
+            self._logger(
+                f"ECHONETLite Message Received from {host} - Processed data is {processed_data}"
+            )
+
+        tid = processed_data["TID"]
+        tid_data = self._message_list.get(tid)
+
+        if self._debug_flag:
+            self._logger(
+                f"ECHONETLite Message Received from {host} - tid_data is {tid_data}"
+            )
+
+        isPush = tid_data is None
+        seojgc = processed_data["SEOJGC"]
+        seojcc = processed_data["SEOJCC"]
+        seojci = processed_data["SEOJCI"]
+        esv = processed_data["ESV"]
+
+        # Passive discovery:
+        #
+        # If a packet arrives from a host that is not known yet, create a
+        # temporary state entry and schedule a background discovery probe.
+        #
+        # The current packet is still processed so that discovery information
+        # (e.g. INSTANCE_LIST) contained in the packet can be extracted
+        # immediately.
+        if self._state.get(host) is None:
+            self._logger(f"Unknown ECHONETLite node has been identified - {host}")
+
+            # Create temporary host state so the current packet can still be processed
+            self._state[host] = {"instances": {}, "available": True}
+
+            # If this packet is already a Node Profile response, discovery data
+            # will be processed from this packet, so skip active discovery.
+            if seojgc == 0x0E and seojcc == 0xF0:
+                pass
+            elif self._should_schedule_unknown_discovery(host):
+                self._unknown_discovery_last_scheduled[host] = time.monotonic()
+                self._unknown_discovery_in_progress.add(host)
+                asyncio.create_task(self._run_unknown_host_discovery(host))
+
+        key = f"{host}-{seojgc}-{seojcc}-{seojci}"
+        esv_set = esv in [SETRES, SETC_SND]
+        esv_get = esv in [GETRES, GET_SNA, INF, INF_SNA, INFC]
+        if not isPush:
+            self._failure_list[tid] = 0
+            self._opc_counts[tid] = len(processed_data["OPC"])
+        # handle discovery message response
+        for opc in processed_data["OPC"]:
+            epc = opc["EPC"]
+            if seojgc == 0x0E and seojcc == 0xF0:  # Node Profile Class Response
+                if epc in [
+                    INSTANCE_LIST,
+                    ENL_MANUFACTURER,
+                    ENL_PRODUCT_CODE,
+                    ENL_UID,
+                ]:  # process discovery data
+                    is_discovery = True
+                    await self.process_discovery_data(host, opc)
+                else:
+                    # @todo handling others
+                    """
+                    Ex. 0x05: Instance list notification
+                    A property to announce the configuration of instances to be disclosed to the network at startup.
+                    This property also announces instances held at the self-node each time the configuration of
+                    instances disclosed to the network is changed during system operation, such as instance
+                    addition or deletion.
+                    """
+                    """
+                    It is desirable to dynamically add and delete entities when there is an increase
+                    or decrease in the number of instances within a device already configured with HA,
+                    but that will be an issue for the future.
+                    """
+                    continue
+            elif seojgc == 0x0F:  # User definition class group
+                if self._debug_flag:
+                    self._logger(
+                        f"Packet received from {host} for user definition class group 0x0F"
+                    )
+                    self._logger(f"Full packet details are {processed_data}")
+                    self._logger("ignoring packet but please notify devs on Github.")
+            else:  # process each EPC in order
+                self._ensure_instance_state(host, seojgc, seojcc, seojci)
+                if epc == ENL_SETMAP or epc == ENL_GETMAP or epc == ENL_STATMAP:
+                    map = EPC_SUPER_FUNCTIONS[epc](opc["EDT"])
+                    self._state[host]["instances"][seojgc][seojcc][seojci][epc] = map
+                elif epc in (ENL_UID, ENL_MANUFACTURER, ENL_PRODUCT_CODE):
+                    try:
+                        self._state[host]["instances"][seojgc][seojcc][seojci][epc] = (
+                            EPC_SUPER_FUNCTIONS[epc](opc["EDT"])
+                        )
+                    except KeyError as e:
+                        if self._debug_flag:
+                            self._logger(
+                                f"ECHONET _state _key error {e} of {host} this packet contains the following data: {processed_data}"
+                            )
+                        continue
+                        # raise Exception(
+                        #     f"ECHONET Packet contains the following data: {processed_data}"
+                        # )
+                else:
+                    if esv_set:
+                        if opc["PDC"] > 0 or isPush:
+                            if not isPush:
+                                self._failure_list[tid] += 1
+                            continue
+                        if tid_data.get(epc) is None:
+                            self._failure_list[tid] += 1
+                            if self._debug_flag:
+                                self._logger(
+                                    f"EDT is not set in send data for EPC '{epc}' - process each EPC"
+                                )
+                            continue
+                        else:
+                            # set request data
+                            opc["EDT"] = tid_data[epc]
+                    elif esv_get:
+                        if opc["PDC"] == 0:
+                            if not isPush:
+                                self._failure_list[tid] += 1
+                            continue
+                    else:
+                        # @todo more esv support
+                        continue
+
+                    if (
+                        epc
+                        not in self._state[host]["instances"][seojgc][seojcc][seojci]
+                        or self._state[host]["instances"][seojgc][seojcc][seojci][epc]
+                        != opc["EDT"]
+                    ):
+                        updated = True
+                    self._state[host]["instances"][seojgc][seojcc][seojci][epc] = opc[
+                        "EDT"
+                    ]
+
+        # Markup "discovered"
+        if is_discovery and len(self._state[host]["instances"]):
+            if self._state[host].get("uid") is None:
+                self._state[host]["uid"] = EPC_SUPER_FUNCTIONS[ENL_UID](b"", host)
+            if self._state[host].get("manufacturer") is None:
+                self._state[host]["manufacturer"] = EPC_SUPER_FUNCTIONS[
+                    ENL_MANUFACTURER
+                ](0xFFFFFF.to_bytes(3, "big"))
+            self._state[host]["discovered"] = True
+
+        # Markup "available"
+        _to_available = False
+        if host in self._state:
+            if not self._state[host].get("available"):
+                _to_available = True
+                self._state[host]["available"] = True
+
+        if _to_available:
+            # Call update callback functions
+            # key is f"{host}-{deojgc}-{deojcc}-{deojci}"
+            for _key in self._update_callbacks:
+                if _key.startswith(host):
+                    for update_func in self._update_callbacks[_key]:
+                        await update_func(False)
+
+            # Call receive callback functions
+            for _key in self._receive_callbacks:
+                if _key.startswith(host):
+                    for receive_func in self._receive_callbacks[_key]:
+                        await receive_func(False)
+
+        else:
+            # Call update callback functions
+            if updated and key in self._update_callbacks:
+                for update_func in self._update_callbacks[key]:
+                    await update_func(isPush)
+
+            # Call receive callback functions
+            if key in self._receive_callbacks:
+                for receive_func in self._receive_callbacks[key]:
+                    await receive_func(isPush)
+
+        # For multicast discovery, keep the TID alive until the discovery
+        # collection window ends so multiple responders can be gathered.
+        if tid in self._discovery_tids:
+            return
+
+        # if we get duplicate packets that have already been processed then
+        # dont worry about the message list, but still process them regardless.
+        if tid_data is not None:
+            del self._message_list[tid]
+
+    async def process_discovery_data(
+        self,
+        host: str,
+        opc_data: Dict[str, Any],
+    ) -> None:
+        """Process discovered device data.
+
+        Args:
+            host: Device host IP
+            opc_data: OPC data from discovery response
+        """
+        if opc_data["EPC"] == ENL_UID:
+            self._state[host]["uid"] = EPC_SUPER_FUNCTIONS[ENL_UID](
+                opc_data["EDT"], host
+            )
+        elif opc_data["EPC"] == ENL_MANUFACTURER:
+            self._state[host]["manufacturer"] = EPC_SUPER_FUNCTIONS[ENL_MANUFACTURER](
+                opc_data["EDT"]
+            )
+        elif opc_data["EPC"] == ENL_PRODUCT_CODE:
+            self._state[host]["product_code"] = EPC_SUPER_FUNCTIONS[ENL_PRODUCT_CODE](
+                opc_data["EDT"]
+            )
+        else:
+            edt = bytearray(opc_data["EDT"])
+            # 1st byte: Total number of instances
+            # 2nd to 253rd bytes: ECHONET object codes (EOJ3 bytes) enumerated
+            edtnum = bytearray(edt)[0]
+            for x in range(edtnum):
+                eojgc = bytearray(edt)[1 + (3 * x)]
+                eojcc = bytearray(edt)[2 + (3 * x)]
+                eojci = bytearray(edt)[3 + (3 * x)]
+                if eojgc != 0x0F:  # ignore this group code.
+                    # populate state table
+                    self._ensure_instance_state(host, eojgc, eojcc, eojci)

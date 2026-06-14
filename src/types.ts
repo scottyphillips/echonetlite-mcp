@@ -317,6 +317,59 @@ export interface DiscoveredDevice {
   timestamp: Date;
 }
 
+/**
+ * Node Profile discovery data from 0x0E 0xF0 xx class responses.
+ * Contains the basic identity information of an ECHONETLite device.
+ * 
+ * Based on pychonet's Node Profile Class (SEOJGC=0x0E, ESV=0xF0) handling:
+ * - INSTANCE_LIST (0xE0): Configuration of instances disclosed to network
+ * - MANUFACTURER (0xFE): Device manufacturer string/bytes
+ * - PRODUCT_CODE (0xFD): Extended Class Definition (ECOI)
+ * - UID (0xFC): Unique device identifier
+ */
+export interface NodeProfileData {
+  /** Instance list configuration - shows all classes on the device */
+  instanceList?: Uint8Array;
+  /** Manufacturer information (bytes or string) */
+  manufacturer?: Uint8Array;
+  /** Product code / Extended Class Definition */
+  productCode?: Uint8Array;
+  /** Unique device identifier */
+  uid?: Uint8Array;
+  /** Device name (if available) */
+  name?: Uint8Array;
+  /** Date of manufacture (if available) */
+  dateOfManufacture?: Uint8Array;
+}
+
+/**
+ * Full device discovery result with all EOJ classes and Node Profile data.
+ * Used when discovering complex devices with multiple device classes.
+ */
+export interface DiscoveredDeviceFull {
+  /** IP address of the device */
+  host: string;
+  /** Port number (typically 3610) */
+  port?: number;
+  /** Node Profile data from 0x0E 0xF0 xx responses */
+  nodeProfile?: NodeProfileData;
+  /** All EOJ instances found on this device */
+  eojInstances: Array<{
+    /** EOJ Group Code */
+    groupCode: number;
+    /** EOJ Class Code */
+    classCode: number;
+    /** EOJ Instance ID */
+    instanceId: number;
+    /** Whether this is the primary/representative instance */
+    isPrimary?: boolean;
+  }>;
+  /** Timestamp when device was first seen */
+  timestamp: Date;
+  /** Whether discovery was completed via active probe or passive observation */
+  discoveryMethod: 'active' | 'passive';
+}
+
 // ============================================================================
 // MCP Types
 // ============================================================================

@@ -18,13 +18,13 @@ echonetlite-mcp/
 ├── PLAN.md                   # This file
 ├── README.md                 # Usage documentation
 ├── src/
-│   ├── index.ts              # MCP server entry point (stdio transport) — 914 lines
-│   ├── echonetlite.ts        # ECHONETLite client wrapper (UDP, binary encoding) — 557 lines
-│   ├── mra.ts                # MRA property enrichment & value decoding — 665 lines
-│   ├── types.ts              # TypeScript type definitions — 373 lines
-│   ├── config.ts             # Configuration constants — 62 lines
+│   ├── index.ts              # MCP server entry point (stdio transport) — ~1150 lines
+│   ├── echonetlite.ts        # ECHONETLite client wrapper (UDP, binary encoding)
+│   ├── mra.ts                # MRA property enrichment & value decoding
+│   ├── types.ts              # TypeScript type definitions
+│   ├── config.ts             # Configuration constants
 │   └── devices/
-│       └── homeAirConditioner.ts  # HVAC device handler — 632 lines
+│       └── homeAirConditioner.ts  # HVAC device handler (status, controls, notifications)
 ├── mra/
 │   ├── mraData/
 │   │   ├── devices/0x0130.json    # Home air conditioner MRA rules
@@ -32,7 +32,10 @@ echonetlite-mcp/
 │   │   ├── definitions/definitions.json  # JSON Schema definitions
 │   │   └── metaData.json
 │   │   └── MCRules/
-└── test-integration.mjs
+├── test-integration.mjs
+├── test-discover.mjs
+├── test-discover-device.mjs
+└── test-probe.mjs
 ```
 
 ---
@@ -76,27 +79,46 @@ echonetlite-mcp/
 
 ---
 
-## MCP Tools Exposed (Full Mode — 16 tools)
+## MCP Tools Exposed (Full Mode — 18 tools)
 
-| Tool Name | Description | Parameters |
-|-----------|-------------|------------|
-| `discover_devices` | Discover all ECHONETLite devices on network | None |
-| `get_device_status` | Get full status of the HVAC device | `host` (optional) |
-| `set_operation` | Turn HVAC on or off | `host`, `operation` ("on"/"off") |
-| `set_operating_mode` | Set operating mode | `host`, `mode` ("auto"/"cool"/"heat"/"dry"/"fan_only") |
-| `set_temperature` | Set target temperature (0-50°C) | `host`, `temperature` (number) |
-| `set_fan_speed` | Set air flow rate | `host`, `speed` ("auto"/"level1"-"level8") |
-| `set_airflow_vertical` | Set vertical vane position | `host`, `position` (5 positions) |
-| `set_airflow_horizontal` | Set horizontal vane position | `host`, `position` (28 positions) |
-| `set_swing_mode` | Set swing mode function | `host`, `mode` ("not-used"/"vert"/"horiz"/"vert-horiz") |
-| `set_auto_direction` | Set automatic direction mode | `host`, `mode` ("auto"/"non-auto"/"auto-vert"/"auto-horiz") |
-| `set_silent_mode` | Set silent operation mode | `host`, `mode` ("normal"/"high-speed"/"silent") |
-| `set_power_saving` | Set power-saving mode | `host`, `state` ("saving"/"normal") |
-| `get_temperatures` | Get room + outdoor temperatures | `host` (optional) |
-| `get_humidity` | Get room humidity | `host` (optional) |
-| `get_property_maps` | Query STATMAP/SETMAP/GETMAP of any EOJ | `host`, `eojgc`, `eojcc`, `eojInstance` |
-| `query_epc` | Query EPC codes from device with MRA decoding | `epcs[]`, `host`, `eojgc`, `eojcc`, `eojInstance` |
-| `get_epc_definition` | Get EPC metadata from MRA (no device query) | `epcs[]`, `host`, `eojgc`, `eojcc`, `eojInstance` |
+### Device Discovery
+
+| Tool Name | Description | Parameters | Status |
+|-----------|-------------|------------|--------|
+| `discover_devices` | Discover all ECHONETLite devices on network via multicast | None | ✅ Complete |
+| `discover_nodes` | Active Node Profile probing — manufacturer, product code, UID, EOJ instances | `host`, `timeout` | ✅ Complete |
+
+### HVAC Control (Bespoke)
+
+| Tool Name | Description | Parameters | Status |
+|-----------|-------------|------------|--------|
+| `get_device_status` | Get full status of the HVAC device | `host` (optional) | ✅ Complete |
+| `set_operation` | Turn HVAC on or off | `host`, `operation` ("on"/"off") | ✅ Complete |
+| `set_operating_mode` | Set operating mode | `host`, `mode` ("auto"/"cool"/"heat"/"dry"/"fan_only") | ✅ Complete |
+| `set_temperature` | Set target temperature (0-50°C) | `host`, `temperature` (number) | ✅ Complete |
+| `set_fan_speed` | Set air flow rate | `host`, `speed` ("auto"/"level1"-"level8") | ✅ Complete |
+| `set_airflow_vertical` | Set vertical vane position | `host`, `position` (5 positions) | ✅ Complete |
+| `set_airflow_horizontal` | Set horizontal vane position | `host`, `position` (28 positions) | ✅ Complete |
+| `set_swing_mode` | Set swing mode function | `host`, `mode` ("not-used"/"vert"/"horiz"/"vert-horiz") | ✅ Complete |
+| `set_auto_direction` | Set automatic direction mode | `host`, `mode` ("auto"/"non-auto"/"auto-vert"/"auto-horiz") | ✅ Complete |
+| `set_silent_mode` | Set silent operation mode | `host`, `mode` ("normal"/"high-speed"/"silent") | ✅ Complete |
+| `set_power_saving` | Set power-saving mode | `host`, `state` ("saving"/"normal") | ✅ Complete |
+
+### Sensor Readings
+
+| Tool Name | Description | Parameters | Status |
+|-----------|-------------|------------|--------|
+| `get_temperatures` | Get room + outdoor temperatures | `host` (optional) | ✅ Complete |
+| `get_humidity` | Get room humidity | `host` (optional) | ✅ Complete |
+
+### EPC Introspection & MRA Lookup
+
+| Tool Name | Description | Parameters | Status |
+|-----------|-------------|------------|--------|
+| `get_property_maps` | Query STATMAP/SETMAP/GETMAP with MRA-based property names and descriptions | `host`, `eojgc`, `eojcc`, `eojInstance` | ✅ Complete |
+| `query_epc` | Query EPC codes from device with MRA decoding (raw + human-readable) | `epcs[]`, `host`, `eojgc`, `eojcc`, `eojInstance` | ✅ Complete |
+| `get_epc_definition` | Get EPC metadata, enum values, bitmaps, $ref-resolved definitions from MRA | `epcs[]`, `host`, `eojgc`, `eojcc`, `eojInstance` | ✅ Complete |
+| `set_epc` | Generic EPC setter — set any writable property on any EOJ instance | `host`, `eojgc`, `eojcc`, `eojInstance`, `epc`, `value` | ✅ Complete |
 
 ---
 
@@ -111,172 +133,108 @@ echonetlite-mcp/
 
 ## MRA Data Architecture Note
 
-**Important:** The current MRA data has been **abbreviated/pruned to HVAC-only** (devices/0x0130.json) to save tokens. The full ECHONETLite MRA specification is significantly larger and contains:
+**MRA Integration Complete:** The server includes full MRA (Machine Readable Index) data integration:
 
-- **200+ device group/class combinations** across all ECHONETLite device types
-- **Common properties** in superClass/0x0000.json shared by ALL devices (operation status, fault codes, power consumption, manufacturer info, etc.)
-- **Extensive definitions** in definitions/definitions.json with detailed type schemas
-- **Rich enum values**, bitmaps, levels, and number ranges for property decoding
+- **Property names & descriptions** — human-readable labels for each EPC code
+- **Value decoding** — raw hex values decoded to meaningful strings/numbers using MRA type schemas
+- **Enum/bitmap support** — full enumeration of possible values with $ref resolution
+- **Level ranges & number formats** — signed/unsigned integers, fixed-point decimals
+- **$ref resolution** — external definition references from definitions.json resolved automatically
 
-The full MRA enables control of lighting, energy monitors, door locks, water sensors, air purifiers, bathroom devices, and many more device types. The current pruned version is a deliberate token optimization that can be expanded as needed.
+The current pruned MRA is HVAC-focused (devices/0x0130.json) but can be expanded to support the full 200+ device group/class combinations in the complete ECHONETLite MRA specification.
 
 ---
 
 ## Enhancement Roadmap
 
-### PHASE 1: Operation Modes (NEW — Token Optimization)
+### ✅ PHASE 1: Core Features — COMPLETE
 
-The server supports two operation modes that control which tools are exposed to the LLM. This allows balancing between ease-of-use (Full Mode) and token efficiency (Light Mode).
-
-#### 1A. Full Mode (Current — Default)
-All 17 bespoke HVAC tools exposed. Best for:
-- Users with dedicated ECHONETLite devices who want simple, semantic tool names
-- Claude Desktop / LM Studio integrations where context window is not constrained
-- Beginners who prefer natural language like "turn on the air conditioner"
-
-**Tools exposed:** All 17 tools listed above.
-
-#### 1B. Light Mode (NEW — Token-Efficient)
-Exposes only the universal ECHONETLite protocol tools. Best for:
-- LLMs with limited context windows
-- Multi-device scenarios where bespoke tools would be overwhelming
-- Advanced users who want generic, cross-device control
-- Cost optimization (fewer tokens in tool definitions = lower API costs)
-
-**Light Mode Tools (5 tools):**
-
-| Tool Name | Description | Parameters |
-|-----------|-------------|------------|
-| `discover_devices` | Discover all ECHONETLite devices on network | None |
-| `query_epc` | Query any EPC code(s) from any device with MRA decoding | `epcs[]`, `host`, `eojgc`, `eojcc`, `eojInstance` |
-| `set_epc` | **Generic EPC setter** — set any writable property on any device | `epc`, `value_hex`, `host`, `eojgc`, `eojcc`, `eojInstance` |
-| `get_epc_definition` | Get EPC metadata, enum values, and settable options from MRA | `epcs[]`, `host`, `eojgc`, `eojcc`, `eojInstance` |
-| `get_property_maps` | Query STATMAP/SETMAP/GETMAP of any EOJ to discover capabilities | `host`, `eojgc`, `eojcc`, `eojInstance` |
-
-**Light Mode Workflow Example:**
-```
-User: "Turn on the air conditioner and set it to 23°C cooling"
-
-LLM in Light Mode:
-1. get_epc_definition(epcs=["0x80", "0xB0", "0xB3"]) 
-   → Returns: 0x80=ON/OFF, 0xB0=Auto/Cool/Heat/Dry/Fan, 0xB3=temp 0-50°C
-   
-2. set_epc(epc="0x80", value_hex="0x30")     → Turn ON
-3. set_epc(epc="0xB0", value_hex="0x42")     → Set cooling mode
-4. set_epc(epc="0xB3", value_hex="0x17")     → Set 23°C (0x17 = 23)
-```
-
-**Token Savings:** Light Mode tool definitions use ~80% fewer tokens than Full Mode (5 generic tools vs 17 bespoke tools).
-
-#### Implementation: Mode Selection via Environment Variable
-
-```typescript
-// config.ts — add
-export const SERVER_MODE = process.env.ECHONET_SERVER_MODE || 'full'; // 'full' | 'light'
-
-// index.ts — conditional tool registration
-const isLightMode = SERVER_MODE === 'light';
-
-if (!isLightMode) {
-  // Register all 17 bespoke HVAC tools (Full Mode)
-}
-
-// Always register these universal tools
-registerTool('query_epc', ...);
-registerTool('set_epc', ...);        // NEW — generic EPC setter
-registerTool('get_epc_definition', ...);
-registerTool('get_property_maps', ...);
-registerTool('discover_devices', ...);
-```
-
----
+All Phase 1 features implemented including:
+- Full HVAC control tools (11 bespoke tools)
+- Sensor readings (temperature, humidity)
+- Device discovery via multicast UDP
+- Real-time notification listener for async updates
+- Generic EPC tools (`set_epc`, `query_epc`)
+- MRA integration with property enrichment
+- Node Profile probing (`discover_nodes`)
+- Property maps with MRA-based names
 
 ### PHASE 2: Core Architecture Improvements (High Priority)
 
-| # | Feature | Description | Files |
-|---|---------|-------------|-------|
-| 2.1 | Device Registry & Caching | Singleton device handlers with TTL expiration discovered via multicast | `src/deviceRegistry.ts` (new), modify `index.ts` |
-| 2.2 | Configuration System | JSON config file (~/.echonetlite-mcp/config.json) with multi-device profiles + zod validation | Extend `config.ts`, new `configFile.ts` |
-| 2.3 | Abstract Device Base Class | Extract shared patterns: EOJ identification, status caching, notification handling | `src/devices/baseDevice.ts` (new) |
-
----
+| # | Feature | Description | Status | Files |
+|---|---------|-------------|--------|-------|
+| 2.1 | Device Registry & Caching | Singleton device handlers with TTL expiration discovered via multicast | 🔲 TODO | `src/deviceRegistry.ts` (new), modify `index.ts` |
+| 2.2 | Configuration System | JSON config file (~/.echonetlite-mcp/config.json) with multi-device profiles + zod validation | 🔲 TODO | Extend `config.ts`, new `configFile.ts` |
+| 2.3 | Abstract Device Base Class | Extract shared patterns: EOJ identification, status caching, notification handling | 🔲 TODO | `src/devices/baseDevice.ts` (new) |
 
 ### PHASE 3: Device Type Expansion (High Priority)
 
 Add handlers for common ECHONETLite device types using MRA data:
 
-| # | Device Type | EOJ Codes | New Tools | MRA File Needed |
-|---|-------------|-----------|-----------|-----------------|
-| 3.1 | Lighting & Brightness | GC=0x02/0x0A, CC=0x80/0x8B | `set_brightness`, `set_color_temperature`, `set_color` | devices/0x0280.json, devices/0x0A80.json |
-| 3.2 | Energy Monitor | GC=0x16, CC=0xE0 | `get_power_consumption`, `get_voltage`, `get_current`, `get_energy_total` | devices/0x16E0.json |
-| 3.3 | Air Purifier | GC=0x19, CC=0xB0 | `set_purification_mode`, `get_air_quality`, `set_timer` | devices/0x19B0.json |
-| 3.4 | Bathroom Device | GC=0x03, CC=0x80 | `set_bath_heater`, `set_fan`, `set_dehumidify` | devices/0x0380.json |
-| 3.5 | Door Lock | GC=0x14, CC=0xA0 | `get_lock_status`, `lock`, `unlock` | devices/0x14A0.json |
-| 3.6 | Water Sensor | GC=0x18, CC=0x80 | `get_water_leak_status`, `get_temperature` | devices/0x1880.json |
-
----
+| # | Device Type | EOJ Codes | New Tools | Status | MRA File Needed |
+|---|-------------|-----------|-----------|--------|-----------------|
+| 3.1 | Lighting & Brightness | GC=0x02/0x0A, CC=0x80/0x8B | `set_brightness`, `set_color_temperature`, `set_color` | 🔲 TODO | devices/0x0280.json, devices/0x0A80.json |
+| 3.2 | Energy Monitor | GC=0x16, CC=0xE0 | `get_power_consumption`, `get_voltage`, `get_current`, `get_energy_total` | 🔲 TODO | devices/0x16E0.json |
+| 3.3 | Air Purifier | GC=0x19, CC=0xB0 | `set_purification_mode`, `get_air_quality`, `set_timer` | 🔲 TODO | devices/0x19B0.json |
+| 3.4 | Bathroom Device | GC=0x03, CC=0x80 | `set_bath_heater`, `set_fan`, `set_dehumidify` | 🔲 TODO | devices/0x0380.json |
+| 3.5 | Door Lock | GC=0x14, CC=0xA0 | `get_lock_status`, `lock`, `unlock` | 🔲 TODO | devices/0x14A0.json |
+| 3.6 | Water Sensor | GC=0x18, CC=0x80 | `get_water_leak_status`, `get_temperature` | 🔲 TODO | devices/0x1880.json |
 
 ### PHASE 4: Protocol Enhancements (Medium Priority)
 
-| # | Feature | Description |
-|---|---------|-------------|
-| 4.1 | SETGET Operation | Atomic set+get via ESV 0x6E — reduces round-trips when setting params and reading back |
-| 4.2 | INSTANCE_LIST Discovery | Support ESV 0xD6 for discovering EOJ instances on devices |
-| 4.3 | Sequence Number Handling | Proper SNA (Sequence Number Ack) tracking for ordered operations |
-| 4.4 | Retry with Backoff | Configurable exponential backoff: 500ms → 1s → 2s → 4s |
-
----
+| # | Feature | Description | Status |
+|---|---------|-------------|--------|
+| 4.1 | SETGET Operation | Atomic set+get via ESV 0x6E — reduces round-trips when setting params and reading back | 🔲 TODO |
+| 4.2 | INSTANCE_LIST Discovery | Support ESV 0xD6 for discovering EOJ instances on devices (partially done in discover_nodes) | 🔄 Partial |
+| 4.3 | Sequence Number Handling | Proper SNA (Sequence Number Ack) tracking for ordered operations | 🔲 TODO |
+| 4.4 | Retry with Backoff | Configurable exponential backoff: 500ms → 1s → 2s → 4s | 🔲 TODO |
 
 ### PHASE 5: MCP Feature Expansion (Medium Priority)
 
-| # | Feature | Description |
-|---|---------|-------------|
-| 5.1 | MCP Prompts | `comfort-setup`, `sleep-mode`, `away-mode` workflow templates for Full Mode |
-| 5.2 | Resource Batching | Per-device resources: `device://{host}/status`, subscription notifications |
-| 5.3 | Roots Capability | Project context awareness for multi-room configurations |
-
----
+| # | Feature | Description | Status |
+|---|---------|-------------|--------|
+| 5.1 | MCP Prompts | `comfort-setup`, `sleep-mode`, `away-mode` workflow templates | 🔲 TODO |
+| 5.2 | Resource Batching | Per-device resources: `device://{host}/status`, subscription notifications | 🔲 TODO |
+| 5.3 | Roots Capability | Project context awareness for multi-room configurations | 🔲 TODO |
 
 ### PHASE 6: Observability & Testing (Important)
 
-| # | Feature | Description |
-|---|---------|-------------|
-| 6.1 | Structured Logging | Winston/pino with debug mode for UDP packet tracing |
-| 6.2 | Health Check | `server_health` tool + `network_diagnostic` |
-| 6.3 | Test Suite | Unit tests for encoding/decoding, mock UDP server, integration tests |
-| 6.4 | CI/CD | GitHub Actions for build/test/lint/publish |
-
----
+| # | Feature | Description | Status |
+|---|---------|-------------|--------|
+| 6.1 | Structured Logging | Winston/pino with debug mode for UDP packet tracing | 🔲 TODO |
+| 6.2 | Health Check | `server_health` tool + `network_diagnostic` | 🔲 TODO |
+| 6.3 | Test Suite | Unit tests for encoding/decoding, mock UDP server, integration tests | 🔄 Partial (test-*.mjs files exist) |
+| 6.4 | CI/CD | GitHub Actions for build/test/lint/publish | 🔲 TODO |
 
 ### PHASE 7: Advanced Features (Future)
 
-- **Energy Tracking** — historical usage, cost estimation, time-of-use rates
-- **Automation Rules Engine** — "If temp > 26 → cool + set 24°C"
-- **Web Dashboard** — HTTP server with real-time UI
-- **ECHONETLite Gateway** — TCP/WebSocket tunneling for remote control
+- 🔲 **Energy Tracking** — historical usage, cost estimation, time-of-use rates
+- 🔲 **Automation Rules Engine** — "If temp > 26 → cool + set 24°C"
+- 🔲 **Web Dashboard** — HTTP server with real-time UI
+- 🔲 **ECHONETLite Gateway** — TCP/WebSocket tunneling for remote control
 
 ---
 
 ## Priority Matrix
 
-| Priority | Phase | Effort | Impact |
-|----------|-------|--------|--------|
-| 🔴 Critical | 1. Operation Modes (Light/Full) | Low | High — token optimization + flexibility |
-| 🟠 High | 2. Core Architecture | Medium | High — enables everything else |
-| 🟠 High | 3. Device Expansion | High | High — expands ecosystem coverage |
-| 🟡 Medium | 4. Protocol Enhancements | Low-Medium | Medium — improves reliability |
-| 🟡 Medium | 5. MCP Feature Expansion | Low | Medium — better AI integration |
-| 🟢 Important | 6. Observability & Testing | Medium | High — production readiness |
-| 🔵 Future | 7. Advanced Features | High | Variable — demand-driven |
+| Priority | Phase | Effort | Impact | Status |
+|----------|-------|--------|--------|--------|
+| ✅ Done | 1. Core Features | Medium | High | **COMPLETE** |
+| 🟠 High | 2. Core Architecture | Medium | High — enables everything else | 🔲 Next |
+| 🟠 High | 3. Device Expansion | High | High — expands ecosystem coverage | 🔲 Future |
+| 🟡 Medium | 4. Protocol Enhancements | Low-Medium | Medium — improves reliability | 🔲 Future |
+| 🟡 Medium | 5. MCP Feature Expansion | Low | Medium — better AI integration | 🔲 Future |
+| 🟢 Important | 6. Observability & Testing | Medium | High — production readiness | 🔲 Future |
+| 🔵 Future | 7. Advanced Features | High | Variable — demand-driven | 🔲 Future |
 
 ---
 
-## Quick Wins (Low Effort, High Impact)
+## Quick Wins (Completed)
 
-1. **Add Light Mode** with generic `set_epc` tool (~4 hours)
-2. **Cache device handlers** instead of recreating per request (~3 hours)
-3. **Add debug logging mode** via environment variable (~2 hours)
-4. **Document both modes** in README with usage examples (~1 hour)
+1. ✅ **Add MRA enrichment** to all EPC tools (~completed)
+2. ✅ **Add discover_nodes tool** for Node Profile probing (~completed)
+3. ✅ **Add set_epc generic setter** for cross-device control (~completed)
+4. ✅ **Property maps with MRA-based names** (~completed)
 
 ---
 
@@ -301,19 +259,7 @@ ECHONET_DEFAULT_HOST=192.168.1.10 node dist/index.js
 export const DEFAULT_HOST = '192.168.1.10';  // Change to your device IP
 ```
 
-### Operation Mode Selection (NEW)
-
-```bash
-# Full Mode — all 17 bespoke HVAC tools (default)
-ECHONET_SERVER_MODE=full node dist/index.js
-
-# Light Mode — 5 generic protocol tools, ~80% fewer tokens in tool definitions
-ECHONET_SERVER_MODE=light node dist/index.js
-```
-
----
-
-## Per-Tool Override
+### Per-Tool Override
 
 Every tool accepts an optional `host` parameter to override the default for that specific call:
 ```json
@@ -342,7 +288,6 @@ The server communicates via stdio, making it compatible with any MCP client.
 
 Add to your Claude Desktop MCP configuration (`claude_desktop_config.json`):
 
-**Full Mode (all HVAC tools):**
 ```json
 {
   "mcpServers": {
@@ -350,24 +295,7 @@ Add to your Claude Desktop MCP configuration (`claude_desktop_config.json`):
       "command": "node",
       "args": ["/path/to/echonetlite-mcp/dist/index.js"],
       "env": {
-        "ECHONET_DEFAULT_HOST": "192.168.1.6",
-        "ECHONET_SERVER_MODE": "full"
-      }
-    }
-  }
-}
-```
-
-**Light Mode (token-efficient):**
-```json
-{
-  "mcpServers": {
-    "echonetlite": {
-      "command": "node",
-      "args": ["/path/to/echonetlite-mcp/dist/index.js"],
-      "env": {
-        "ECHONET_DEFAULT_HOST": "192.168.1.6",
-        "ECHONET_SERVER_MODE": "light"
+        "ECHONET_DEFAULT_HOST": "192.168.1.6"
       }
     }
   }
@@ -388,8 +316,7 @@ LM Studio supports MCP servers via stdio transport. Create or edit the MCP confi
       "command": "node",
       "args": ["C:\\path\\to\\echonetlite-mcp\\dist/index.js"],
       "env": {
-        "ECHONET_DEFAULT_HOST": "192.168.1.6",
-        "ECHONET_SERVER_MODE": "light"
+        "ECHONET_DEFAULT_HOST": "192.168.1.6"
       }
     }
   }
@@ -408,8 +335,7 @@ Configure in your VS Code MCP extension settings:
       "command": "node",
       "args": ["/path/to/echonetlite-mcp/dist/index.js"],
       "env": {
-        "ECHONET_DEFAULT_HOST": "192.168.1.6",
-        "ECHONET_SERVER_MODE": "full"
+        "ECHONET_DEFAULT_HOST": "192.168.1.6"
       }
     }
   ]
@@ -428,10 +354,9 @@ Try these natural language prompts with your MCP client:
 - `"What are the current temperatures?"` → calls `get_temperatures`
 - `"Find all ECHONET devices on my network"` → calls `discover_devices`
 - `"Set fan speed to level 3"` → calls `set_fan_speed` with `speed="level3"`
+- `"Discover all nodes on 192.168.1.6"` → calls `discover_nodes` for full device profile
 
-## Example Prompts — Light Mode
-
-In Light Mode, the LLM uses the generic tools to discover and control any device:
+## Example Prompts — EPC Introspection
 
 - `"What can this device do?"` → calls `get_property_maps` to discover STATMAP/SETMAP/GETMAP
 - `"Read the current temperature"` → calls `query_epc(epcs=["0xBB"])` 
@@ -446,14 +371,14 @@ In Light Mode, the LLM uses the generic tools to discover and control any device
 ```
 echonetlite-mcp/
 ├── src/
-│   ├── index.ts              # MCP server entry point (Full + Light mode tools)
+│   ├── index.ts              # MCP server entry point (18 tools + 2 resources)
 │   ├── echonetlite.ts        # ECHONETLite client wrapper (async/await over UDP)
 │   ├── mra.ts                # MRA property enrichment & value decoding
 │   ├── devices/
 │   │   ├── baseDevice.ts          # [FUTURE] Abstract device handler base class
-│   │   └── homeAirConditioner.ts  # HVAC device handler (Full Mode only)
+│   │   └── homeAirConditioner.ts  # HVAC device handler (status, controls, notifications)
 │   ├── types.ts              # TypeScript type definitions
-│   └── config.ts             # Configuration (host, port, mode, multicast)
+│   └── config.ts             # Configuration (host, port, multicast)
 ├── mra/
 │   └── mraData/
 │       ├── devices/          # Device-specific MRA rules (0x0130 = HVAC)
@@ -462,7 +387,8 @@ echonetlite-mcp/
 ├── package.json
 ├── tsconfig.json
 ├── PLAN.md                   # This file — implementation plan + roadmap
-└── README.md                 # Usage documentation
+├── README.md                 # Usage documentation
+└── test-*.mjs                # Integration test files
 ```
 
 ---
@@ -474,8 +400,8 @@ echonetlite-mcp/
 3. **Configurable host** — default 192.168.1.6, overridable per-tool call
 4. **Notification listener** runs continuously to capture unsolicited device updates via multicast
 5. **MRA as source of truth** for property names, descriptions, and value decoding
-6. **Dual operation modes** — Full Mode for ease-of-use, Light Mode for token efficiency
-7. **Generic EPC tools** (`query_epc`, `set_epc`) work across ALL device types
+6. **Generic EPC tools** (`query_epc`, `set_epc`) work across ALL device types
+7. **Node Profile probing** enables full device introspection without prior knowledge
 
 ---
 

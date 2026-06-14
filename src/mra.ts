@@ -26,17 +26,15 @@ interface MraDeviceClass {
   elProperties: MraProperty[];
 }
 
-interface MraSuperClass {
-  eoj: string;
-  className: { ja: string; en: string };
-  elProperties: MraProperty[];
-}
-
 /** Lookup table: EOJ key (e.g., "0x0130") → property map by EPC */
 interface PropertyLookup {
   eoJName: string;
+  shortName?: string;
   properties: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }>;
 }
+
+// Cache for superclass properties (loaded once from 0x0000.json, shared by all devices)
+let superClassPropsCache: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> | null = null;
 
 let propertyCache: Map<string, PropertyLookup> | null = null;
 let definitionsCache: any = null;
@@ -46,12 +44,46 @@ export function buildEojKey(gc: number, cc: number, inst?: number): string {
   return `0x${gc.toString(16).padStart(2, '0').toUpperCase()}${cc.toString(16).padStart(2, '0').toUpperCase()}`;
 }
 
+/** Load superclass properties from the main superclass file (0x0000.json) */
+function loadSuperClassProperties(superClassDir: string): Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> | null {
+  const superClassFile = path.join(superClassDir, '0x0000.json');
+  if (!fs.existsSync(superClassFile)) return null;
+  
+  try {
+    const content = JSON.parse(fs.readFileSync(superClassFile, 'utf-8'));
+    if (content.elProperties && Array.isArray(content.elProperties)) {
+      const props: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> = new Map();
+      for (const p of content.elProperties) {
+        if (p.epc != null && p.shortName) {
+          const propInfo = {
+            name: p.propertyName?.en || p.propertyName?.ja || '',
+            shortName: p.shortName,
+            accessRule: p.accessRule || {},
+            description: p.descriptions?.en || p.descriptions?.ja || ''
+          };
+          props.set(parseInt(p.epc, 16), propInfo);
+        }
+      }
+      return props;
+    }
+  } catch {
+    // Skip invalid files
+  }
+  return null;
+}
+
 /** Load all MRA data from disk */
 export function loadMraData(mraDir?: string): Map<string, PropertyLookup> {
   if (propertyCache) return propertyCache;
   
   const dir = mraDir || path.join(__dirname, '..', 'mra', 'mraData');
   const result = new Map<string, PropertyLookup>();
+
+  // Load superclass properties FIRST (common properties inherited by ALL devices)
+  const superClassDir = path.join(dir, 'superClass');
+  if (fs.existsSync(superClassDir)) {
+    superClassPropsCache = loadSuperClassProperties(superClassDir);
+  }
 
   // Load device-specific classes
   const devicesDir = path.join(dir, 'devices');
@@ -61,10 +93,19 @@ export function loadMraData(mraDir?: string): Map<string, PropertyLookup> {
       try {
         const content = JSON.parse(fs.readFileSync(path.join(devicesDir, file), 'utf-8'));
         if (content.elProperties && Array.isArray(content.elProperties)) {
-          const props = new Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }>();
+          // Start with superclass properties as the base
+          const props: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> = new Map();
+          
+          // First add all superclass properties (shared by all devices)
+          if (superClassPropsCache) {
+            for (const [epc, info] of superClassPropsCache) {
+              props.set(epc, info);
+            }
+          }
+          
+          // Then overlay device-specific properties (may override superclass for same EPC)
           for (const p of content.elProperties) {
             if (p.epc != null && p.shortName) {
-              // Handle multiple validRelease entries for same EPC - later ones override
               const propInfo = {
                 name: p.propertyName?.en || p.propertyName?.ja || '',
                 shortName: p.shortName,
@@ -74,46 +115,12 @@ export function loadMraData(mraDir?: string): Map<string, PropertyLookup> {
               props.set(parseInt(p.epc, 16), propInfo);
             }
           }
+          
           result.set(content.eoj, {
             eoJName: content.className?.en || content.className?.ja || content.eoj,
+            shortName: content.shortName,
             properties: props
           });
-        }
-      } catch (e) {
-        // Skip invalid files
-      }
-    }
-  }
-
-  // Load super classes (common properties inherited by all devices)
-  const superClassDir = path.join(dir, 'superClass');
-  if (fs.existsSync(superClassDir)) {
-    const files = fs.readdirSync(superClassDir).filter(f => f.endsWith('.json'));
-    for (const file of files) {
-      try {
-        const content = JSON.parse(fs.readFileSync(path.join(superClassDir, file), 'utf-8'));
-        if (content.elProperties && Array.isArray(content.elProperties)) {
-          // Super class properties are shared - store separately for merging
-          const superProps: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> = new Map();
-          for (const p of content.elProperties) {
-            if (p.epc != null && p.shortName) {
-              const propInfo = {
-                name: p.propertyName?.en || p.propertyName?.ja || '',
-                shortName: p.shortName,
-                accessRule: p.accessRule || {},
-                description: p.descriptions?.en || p.descriptions?.ja || ''
-              };
-              superProps.set(parseInt(p.epc, 16), propInfo);
-            }
-          }
-          // Merge super class props into each device that exists
-          for (const [eojKey, lookup] of result.entries()) {
-            for (const [epc, info] of superProps) {
-              if (!lookup.properties.has(epc)) {
-                lookup.properties.set(epc, info);
-              }
-            }
-          }
         }
       } catch (e) {
         // Skip invalid files

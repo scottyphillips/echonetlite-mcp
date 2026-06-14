@@ -17,7 +17,20 @@ import type {
   Eoj,
   EpcData,
   DiscoveredDevice,
+  NodeProfileData,
+  DiscoveredDeviceFull,
 } from './types.js';
+
+import {
+  EPC_INSTANCE_LIST,
+  EPC_UID,
+  EPC_NAME,
+  EPC_DATE_OF_MANUFACTURE,
+  EPC_MANUFACTURER,
+  EPC_ECOI,
+  NODE_PROFILE_GROUP,
+  NODE_PROFILE_CLASS,
+} from './config.js';
 
 // ============================================================================
 // Binary Packet Builders / Parsers
@@ -248,8 +261,114 @@ export function decodeSInt16(pv: Uint8Array): number {
 }
 
 // ============================================================================
-// ECHONETLite Client Class
+// Discovery Helper Functions
 // ============================================================================
+
+/**
+ * Build DiscoveredDeviceFull from collected ECHONETLite responses.
+ * 
+ * Per pychonet echonetMessageReceived logic:
+ * - Filter for Node Profile Class Response (SEOJGC=0x0E, ESV=0xF0)  
+ * - Extract EPC data: INSTANCE_LIST, MANUFACTURER, PRODUCT_CODE, UID
+ * - Also collect all EOJ instances from any class responses received
+ */
+function buildDiscoveredDevice(
+  host: string,
+  responses: EchonetPacket[]
+): DiscoveredDeviceFull {
+  const nodeProfile: NodeProfileData = {};
+  const eojInstancesMap = new Map<string, { groupCode: number; classCode: number; instanceId: number }>();
+  
+  for (const packet of responses) {
+    const seoJgc = packet.sourceEoj.groupCode;
+    const seoJcc = packet.sourceEoj.classCode;
+    const seoJci = packet.sourceEoj.instanceId;
+    
+    // Track all EOJ instances from any response
+    const eojKey = `${seoJgc}-${seoJcc}-${seoJci}`;
+    if (!eojInstancesMap.has(eojKey)) {
+      eojInstancesMap.set(eojKey, {
+        groupCode: seoJgc,
+        classCode: seoJcc,
+        instanceId: seoJci,
+      });
+    }
+    
+    // Process Node Profile Class responses (SEOJGC=0x0E, SEOJCC=0xF0)
+    if (seoJgc === NODE_PROFILE_GROUP && seoJcc === NODE_PROFILE_CLASS) {
+      // This is a Node Profile Class response
+      for (const epcData of packet.epcData) {
+        switch (epcData.epc) {
+          case EPC_INSTANCE_LIST:  // 0xD6 - Instance List Notification
+            nodeProfile.instanceList = epcData.pv;
+            break;
+          case EPC_MANUFACTURER:   // 0x8A - Manufacturer
+            nodeProfile.manufacturer = epcData.pv;
+            break;
+          case EPC_ECOI:           // 0x8C - Extended Class Definition (Product Code)
+            nodeProfile.productCode = epcData.pv;
+            break;
+          case EPC_UID:            // 0x83 - Unique Device Identifier
+            nodeProfile.uid = epcData.pv;
+            break;
+          case EPC_NAME:           // 0xFB - Device Name
+            nodeProfile.name = epcData.pv;
+            break;
+          case EPC_DATE_OF_MANUFACTURE:  // 0xFA - Date of Manufacture
+            nodeProfile.dateOfManufacture = epcData.pv;
+            break;
+        }
+      }
+    }
+  }
+  
+  // Parse INSTANCE_LIST (EPC 0xD6) to find all EOJ instances on the device.
+  // Per pychonet process_discovery_data():
+  //   edtnum = bytearray(edt)[0]           # Number of EOJ entries (NOT total bytes)
+  //   For each entry x in range(edtnum):
+  //     eojgc = edt[1 + (3 * x)]           # Group Code (3 bytes per entry)
+  //     eojcc = edt[2 + (3 * x)]           # Class Code  
+  //     eojci = edt[3 + (3 * x)]           # Instance ID
+  //   Entries with group code 0x0F (User definition) are ignored.
+  if (nodeProfile.instanceList && nodeProfile.instanceList.length > 1) {
+    const instList = nodeProfile.instanceList;
+    const edtnum = instList[0]; // Number of EOJ entries (each entry is 3 bytes)
+    
+    for (let x = 0; x < edtnum; x++) {
+      const baseOffset = 1 + (3 * x);
+      if (baseOffset + 2 >= instList.length) break;
+      
+      const eojgc = instList[baseOffset];
+      const eojcc = instList[baseOffset + 1];
+      const eojci = instList[baseOffset + 2];
+      
+      // Skip user definition class group (0x0F) per pychonet logic
+      if (eojgc === 0x0f) continue;
+      
+      const key = `${eojgc}-${eojcc}-${eojci}`;
+      if (!eojInstancesMap.has(key)) {
+        eojInstancesMap.set(key, {
+          groupCode: eojgc,
+          classCode: eojcc,
+          instanceId: eojci,
+        });
+      }
+    }
+  }
+  
+  const eojInstances = Array.from(eojInstancesMap.values()).map((e, i) => ({
+    ...e,
+    isPrimary: i === 0,
+  }));
+  
+  return {
+    host,
+    nodeProfile: Object.keys(nodeProfile).length > 0 ? nodeProfile : undefined,
+    eojInstances,
+    timestamp: new Date(),
+    discoveryMethod: 'active',
+  };
+}
 
 interface PendingRequest {
   resolve: (value: EchonetPacket) => void;
@@ -535,6 +654,180 @@ export class EchonetLiteClient {
     return response.epcData;
   }
 
+  /**
+   * Discover a specific device by IP address using active Node Profile probing.
+   * 
+   * Based on pychonet's discover() and echonetMessageReceived() logic:
+   * 
+   * DISCOVERY PACKET STRUCTURE:
+   * - When host is multicast (224.0.23.0): Only request INSTANCE_LIST (0xE0)
+   * - When host is specific IP: Request full Node Profile data:
+   *   - 0xFE (ENL_MANUFACTURER): Device manufacturer
+   *   - 0xFD (ENL_ECOI/PRODUCT_CODE): Product code / Extended Class Definition  
+   *   - 0xFC (ENL_UID): Unique device identifier
+   *   - 0xE0 (INSTANCE_LIST): All instance classes on the device
+   * 
+   * The request targets the Node Profile Class (0x0E 0xF0 0xFF) which every
+   * ECHONETLite device MUST implement according to the MRA specification.
+   * 
+   * RESPONSE PROCESSING:
+   * - Responses come back as Node Profile Class Response (SEOJGC=0x0E, ESV=0xF0)
+   * Each response contains EPC/EDT pairs with the discovered data
+   - Multiple instances may be reported via INSTANCE_LIST encoding
+   */
+  async discoverDevice(
+    host: string,
+    timeoutMs: number = REQUEST_TIMEOUT_MS
+  ): Promise<DiscoveredDeviceFull> {
+    if (!this.udpSocket) {
+      throw new Error('ECHONETLite client not initialized');
+    }
+
+    console.error(`[discover_device] Starting discovery for host=${host}, timeout=${timeoutMs}ms`);
+
+    // Collect responses from this specific host
+    const collectedResponses: EchonetPacket[] = [];
+    const seenTids = new Set<number>();
+
+    // Build discovery request packet per pychonet logic:
+    // For specific host, request ALL Node Profile EPCs:
+    //   0xFE (Manufacturer), 0xFD (Product Code/ECOI), 0xFC (UID), 0xE0 (Instance List)
+    const discoveryPacket: EchonetPacket = {
+      header: { echonetVersion: [0x10, 0x81], tid: 0 },
+      sourceEoj: { 
+        groupCode: DEFAULT_SEOJ_GROUP, 
+        classCode: DEFAULT_SEOJ_CLASS, 
+        instanceId: 0x01 
+      },
+      destinationEoj: { 
+        groupCode: NODE_PROFILE_GROUP,       // 0x0E - Node Profile group
+        classCode: NODE_PROFILE_CLASS,        // 0xF0 - Node Profile class  
+        instanceId: 0x01                      // Node Profile instance (per MRA spec)
+      },
+      operation: 'get',
+      epcData: [
+        { epc: EPC_MANUFACTURER, pv: new Uint8Array([]), ac: 4 },   // 0xFE - Manufacturer
+        { epc: EPC_ECOI, pv: new Uint8Array([]), ac: 4 },           // 0xFD - Product Code/ECOI
+        { epc: EPC_UID, pv: new Uint8Array([]), ac: 4 },            // 0xFC - Unique ID
+        { epc: EPC_INSTANCE_LIST, pv: new Uint8Array([0x01]), ac: 4 }, // 0xE0 - Instance List (with GET parameter)
+      ],
+    };
+
+    const buffer = buildPacketBuffer(discoveryPacket);
+    
+    console.error(`[discover_device] Built packet, length=${buffer.length} bytes`);
+    console.error(`[discover_device] Raw hex: ${buffer.toString('hex')}`);
+    
+    // Read the actual TID that was written by buildPacketBuffer (bytes 2-3, big-endian)
+    const actualTid = buffer.readUInt16BE(2);
+    console.error(`[discover_device] Assigned TID=0x${actualTid.toString(16).padStart(4, '0')} (${actualTid})`);
+
+    // Set up listener AFTER building packet so we catch the correct TID
+    const discoveryListener = (packet: EchonetPacket, info: { address: string; port: number }) => {
+      console.error(`[discover_device] Listener: received from ${info.address}:${info.port}`);
+      console.error(`[discover_device] Listener: packet TID=0x${packet.header.tid.toString(16).padStart(4, '0')}, SEOJ=${packet.sourceEoj.groupCode.toString(16)}-${packet.sourceEoj.classCode.toString(16)}-${packet.sourceEoj.instanceId.toString(16)}`);
+      
+      // Only collect from the target host
+      if (info.address !== host) {
+        console.error(`[discover_device] Listener: IGNORED - wrong host`);
+        return;
+      }
+
+      // Filter by expected TID to only collect responses to our request
+      if (packet.header.tid !== actualTid) {
+        console.error(`[discover_device] Listener: IGNORED - TID mismatch`);
+        return;
+      }
+
+      // Track TIDs to avoid duplicates
+      if (seenTids.has(actualTid)) {
+        console.error(`[discover_device] Listener: IGNORED - duplicate TID`);
+        return;
+      }
+      
+      console.error(`[discover_device] Listener: ACCEPTED!`);
+      seenTids.add(actualTid);
+      collectedResponses.push(packet);
+    };
+
+    this.onNotification(discoveryListener);
+
+    // Send discovery request to the specific host
+    console.error(`[discover_device] Sending first probe to ${host}:${ECHONET_PORT}`);
+    await new Promise<void>((resolve, reject) => {
+      this.udpSocket!.send(buffer, 0, buffer.length, ECHONET_PORT, host, (err) => {
+        if (err) {
+          console.error(`[discover_device] First probe send error: ${err.message}`);
+          reject(new Error(`Discovery send error: ${err.message}`));
+        } else {
+          console.error(`[discover_device] First probe sent OK`);
+          resolve();
+        }
+      });
+    });
+
+    // Also retry once per pychonet DISCOVERY_RETRIES pattern
+    console.error(`[discover_device] Waiting ${DISCOVERY_INTERVAL_MS}ms before retry...`);
+    await new Promise(resolve => setTimeout(resolve, DISCOVERY_INTERVAL_MS));
+    
+    console.error(`[discover_device] Sending second probe to ${host}:${ECHONET_PORT}`);
+    await new Promise<void>((resolve, reject) => {
+      this.udpSocket!.send(buffer, 0, buffer.length, ECHONET_PORT, host, (err) => {
+        if (err) {
+          console.error(`[discover_device] Second probe send error: ${err.message}`);
+          reject(new Error(`Discovery send error: ${err.message}`));
+        } else {
+          console.error(`[discover_device] Second probe sent OK`);
+          resolve();
+        }
+      });
+    });
+
+    // Wait for responses with the actual TID used in the packet
+    console.error(`[discover_device] Waiting ${timeoutMs}ms for responses...`);
+    
+    const result = await new Promise<DiscoveredDeviceFull>((resolve) => {
+      setTimeout(() => {
+        console.error(`[discover_device] Timeout reached. Collected ${collectedResponses.length} response(s)`);
+        
+        // Log all collected responses
+        for (let i = 0; i < collectedResponses.length; i++) {
+          const pkt = collectedResponses[i];
+          console.error(`[discover_device] Response #${i + 1}:`);
+          console.error(`[discover_device]   SEOJ: ${pkt.sourceEoj.groupCode.toString(16).padStart(2, '0')}-${pkt.sourceEoj.classCode.toString(16).padStart(2, '0')}-${pkt.sourceEoj.instanceId.toString(16).padStart(2, '0')}`);
+          console.error(`[discover_device]   ESV: 0x${pkt.esv?.toString(16) || 'N/A'}`);
+          console.error(`[discover_device]   EPCs: ${pkt.epcData.map(e => `0x${e.epc.toString(16).padStart(2, '0')}(${e.pv.length} bytes)`).join(', ')}`);
+          
+          // Decode INSTANCE_LIST if present
+          const instListEpc = pkt.epcData.find(e => e.epc === EPC_INSTANCE_LIST);
+          if (instListEpc && instListEpc.pv.length > 0) {
+            const edtnum = instListEpc.pv[0];
+            console.error(`[discover_device]   INSTANCE_LIST: ${edtnum} entries`);
+            for (let x = 0; x < edtnum; x++) {
+              const baseOffset = 1 + (3 * x);
+              if (baseOffset + 2 >= instListEpc.pv.length) break;
+              console.error(`[discover_device]     Entry ${x}: 0x${instListEpc.pv[baseOffset].toString(16).padStart(2, '0')}-0x${instListEpc.pv[baseOffset + 1].toString(16).padStart(2, '0')}-0x${instListEpc.pv[baseOffset + 2].toString(16).padStart(2, '0')}`);
+            }
+          }
+        }
+
+        this.offNotification(discoveryListener);
+        resolve(buildDiscoveredDevice(host, collectedResponses));
+      }, timeoutMs);
+    });
+    
+    console.error(`[discover_device] Final result: ${result.eojInstances.length} EOJ instances found`);
+    return result;
+  }
+
+  /**
+   * Build DiscoveredDeviceFull from collected ECHONETLite responses.
+   * 
+   * Per pychonet logic:
+   * - Filter for Node Profile Class Response (SEOJGC=0x0E, ESV=0xF0)
+   * - Extract EPC data: INSTANCE_LIST, MANUFACTURER, PRODUCT_CODE, UID
+   * - Also collect all EOJ instances from any class responses received
+   */
   onNotification(listener: (packet: EchonetPacket, info: { address: string; port: number }) => void): void {
     this.notificationListeners.add(listener);
   }
@@ -554,4 +847,4 @@ export class EchonetLiteClient {
 }
 
 // Re-export types
-export type { EchonetPacket, Eoj, EpcData, DiscoveredDevice };
+export type { EchonetPacket, Eoj, EpcData, DiscoveredDevice, NodeProfileData, DiscoveredDeviceFull };

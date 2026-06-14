@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { EchonetLiteClient } from './echonetlite.js';
 import { HomeAirConditioner } from './devices/homeAirConditioner.js';
 import { DEFAULT_HOST, HVAC_EOJGC, HVAC_EOJCC, HVAC_EOJ_INSTANCE } from './config.js';
-import type { HvacStatus, DiscoveredDevice, Eoj } from './types.js';
+import type { HvacStatus, DiscoveredDevice, Eoj, NodeProfileData, DiscoveredDeviceFull } from './types.js';
 import { loadMraData, buildEojKey, getEojName, decodeEpcValue, getPropertyInfo, getRawMraPropertyData, loadDefinitions, resolveRef } from './mra.js';
 
 // ============================================================================
@@ -62,6 +62,148 @@ server.registerTool(
     }
   }
 );
+
+/**
+ * Discover nodes on a specific device by IP address using active Node Profile probing.
+ * 
+ * Based on pychonet's discover() logic from the MRA test harness (MoekadenRoom):
+ * https://github.com/SonyCSL/MoekadenRoom
+ * 
+ * DISCOVERY PACKET:
+ * - Targets the Node Profile Class (0x0E 0xF0 0x01) which every ECHONETLite device implements
+ * - Requests these EPCs per pychonet ENL_* constants:
+ *   - 0x8A (ENL_MANUFACTURER): Device manufacturer info
+ *   - 0x8C (ENL_ECOI/PRODUCT_CODE): Product code / Extended Class Definition
+ *   - 0x83 (ENL_UID): Unique device identifier  
+ *   - 0xD6 (INSTANCE_LIST): All instance classes on the device
+ * 
+ * RESPONSE PROCESSING:
+ * - Responses come as Node Profile Class Response (SEOJGC=0x0E, SEOJCC=0xF0)
+ * - Each response contains EPC/EDT pairs with discovered data
+ * - INSTANCE_LIST is parsed to extract all EOJ instances on the device
+ * - This enables discovery of complex devices with multiple device classes
+ * 
+ * The instance list is enriched with MRA device definitions from mra/mraData/devices,
+ * including class names (EN/JA), short names, and property definitions.
+ */
+server.registerTool(
+  'discover_nodes',
+  {
+    description: 'Discover all ECHONETLite nodes on a specific device by IP address using active Node Profile probing. Sends GET requests for manufacturer, product code, UID, and instance list to the Node Profile Class (0x0E 0xF0). Returns full device profile including all EOJ instances enriched with MRA device definitions (class names, short names, property definitions). Based on pychonet discover() logic.',
+    inputSchema: {
+      host: z.string().describe('IP address of the device to discover (e.g., "192.168.1.234")'),
+      timeout: z.number().optional().describe('Discovery timeout in milliseconds (default: 5000)'),
+    },
+  },
+  async ({ host, timeout }) => {
+    try {
+      const targetHost = host;
+      const discoveryTimeout = timeout || 5000;
+      
+      // Perform active Node Profile discovery per pychonet logic
+      const device: DiscoveredDeviceFull = await client.discoverDevice(targetHost, discoveryTimeout);
+      
+      // Load MRA data for enriching instance information
+      const mraData = loadMraData();
+      
+      // Format the result for readability with enriched instance data
+      const formattedResult = {
+        host: device.host,
+        discoveryMethod: device.discoveryMethod,
+        timestamp: device.timestamp.toISOString(),
+        nodeProfile: device.nodeProfile ? {
+          manufacturer: device.nodeProfile.manufacturer 
+            ? `0x${Array.from(device.nodeProfile.manufacturer).map(b => b.toString(16).padStart(2, '0')).join(' ')}`
+            : undefined,
+          productCode: device.nodeProfile.productCode
+            ? `0x${Array.from(device.nodeProfile.productCode).map(b => b.toString(16).padStart(2, '0')).join(' ')}`
+            : undefined,
+          uid: device.nodeProfile.uid
+            ? `0x${Array.from(device.nodeProfile.uid).map(b => b.toString(16).padStart(2, '0')).join(' ')}`
+            : undefined,
+          name: device.nodeProfile.name
+            ? decodeUtf8Bytes(device.nodeProfile.name)
+            : undefined,
+          dateOfManufacture: device.nodeProfile.dateOfManufacture
+            ? `0x${Array.from(device.nodeProfile.dateOfManufacture).map(b => b.toString(16).padStart(2, '0')).join(' ')}`
+            : undefined,
+          instanceList: device.nodeProfile.instanceList
+            ? `0x${Array.from(device.nodeProfile.instanceList).map(b => b.toString(16).padStart(2, '0')).join(' ')}`
+            : undefined,
+        } : undefined,
+        eojInstances: device.eojInstances.map(e => {
+          // Build EOJ key from group code and class code
+          const eojKey = buildEojKey(e.groupCode, e.classCode);
+          
+          // Look up MRA definition for this EOJ
+          const mraEntry = mraData.get(eojKey);
+          
+          const enrichedInstance: any = {
+            groupCode: `0x${e.groupCode.toString(16).toUpperCase()}`,
+            classCode: `0x${e.classCode.toString(16).toUpperCase()}`,
+            instanceId: `0x${e.instanceId.toString(16).toUpperCase()}`,
+            isPrimary: e.isPrimary,
+          };
+          
+          // Add MRA definition names if available
+          if (mraEntry) {
+            enrichedInstance.className = mraEntry.eoJName;
+            enrichedInstance.shortName = mraEntry.shortName;
+          } else {
+            enrichedInstance.className = `Unknown (${eojKey})`;
+          }
+          
+          return enrichedInstance;
+        }),
+      };
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(formattedResult, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Device discovery failed: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/**
+ * Helper function to decode UTF-8 bytes from Node Profile name data.
+ */
+function decodeUtf8Bytes(bytes: Uint8Array): string {
+  try {
+    const decoder = new TextDecoder('utf-8');
+    return decoder.decode(bytes);
+  } catch {
+    // Fallback: manual ASCII/UTF-8 decoding
+    let result = '';
+    for (let i = 0; i < bytes.length; i++) {
+      const byte = bytes[i];
+      if (byte < 0x80) {
+        result += String.fromCharCode(byte);
+      } else if (byte >= 0xc0 && byte < 0xe0) {
+        // 2-byte sequence
+        if (i + 1 < bytes.length) {
+          result += String.fromCharCode(
+            ((byte & 0x1f) << 6) | (bytes[i + 1] & 0x3f)
+          );
+          i++;
+        }
+      } else if (byte >= 0xe0 && byte < 0xf0) {
+        // 3-byte sequence
+        if (i + 2 < bytes.length) {
+          result += String.fromCharCode(
+            ((byte & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f)
+          );
+          i += 2;
+        }
+      }
+    }
+    return result;
+  }
+}
 
 /** Get full status of the HVAC device */
 server.registerTool(
@@ -119,6 +261,94 @@ server.registerTool(
     } catch (err) {
       return {
         content: [{ type: 'text', text: `Failed to set operation: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Set EPC on any EOJ instance (generic, instance-type agnostic) */
+server.registerTool(
+  'set_epc',
+  {
+    description: 'Set an EPC (EPC Property Code) value on any ECHONETLite device node. This is a generic tool that works with any EOJ (ECHONET Object) instance regardless of device type. Specify the target EOJ by group code, class code, and instance ID, then provide the EPC code and value as hex bytes. Example: set operating mode (0xB0) to "heat" (0x31) on a HVAC (0x01 0x30 0x01).',
+    inputSchema: {
+      host: z.string().describe('IP address of the device'),
+      eojgc: z.string().describe('EOJ Group Code in hex (e.g., "0x01" for HVAC)'),
+      eojcc: z.string().describe('EOJ Class Code in hex (e.g., "0x30" for home air conditioner)'),
+      eojInstance: z.string().optional().describe('EOJ Instance ID in hex (default: "0x01")'),
+      epc: z.string().describe('EPC code in hex (e.g., "0xB0" for operating mode)'),
+      value: z.string().describe('Value to set as hex bytes (e.g., "31" for heat, "41" for auto). Multiple bytes can be concatenated (e.g., "0032" for a 2-byte value).'),
+    },
+  },
+  async ({ host, eojgc, eojcc, eojInstance, epc, value }) => {
+    try {
+      // Parse EOJ components from hex strings
+      const destinationEoj: Eoj = {
+        groupCode: parseInt(eojgc.replace('0x', ''), 16),
+        classCode: parseInt(eojcc.replace('0x', ''), 16),
+        instanceId: eojInstance ? parseInt(eojInstance.replace('0x', ''), 16) : 0x01,
+      };
+
+      // Parse EPC code from hex string
+      const epcNum = parseInt(epc.replace('0x', ''), 16);
+      if (isNaN(epcNum)) {
+        return {
+          content: [{ type: 'text', text: `Invalid EPC code: ${epc}` }],
+          isError: true,
+        };
+      }
+
+      // Parse value hex string to Uint8Array
+      const valueHex = value.replace('0x', '');
+      if (valueHex.length === 0) {
+        return {
+          content: [{ type: 'text', text: `Empty value provided` }],
+          isError: true,
+        };
+      }
+
+      if (valueHex.length % 2 !== 0) {
+        return {
+          content: [{ type: 'text', text: `Value hex string must have even length (byte-aligned): ${value}` }],
+          isError: true,
+        };
+      }
+
+      const pvBytes: number[] = [];
+      for (let i = 0; i < valueHex.length; i += 2) {
+        const byteVal = parseInt(valueHex.substring(i, i + 2), 16);
+        if (isNaN(byteVal)) {
+          return {
+            content: [{ type: 'text', text: `Invalid hex byte at position ${i}: ${value}` }],
+            isError: true,
+          };
+        }
+        pvBytes.push(byteVal);
+      }
+
+      // Send the SET request to the device
+      await client.set(host, [{ epc: epcNum, pv: new Uint8Array(pvBytes) }], destinationEoj);
+
+      return {
+        content: [{ 
+          type: 'text', 
+          text: JSON.stringify({
+            status: 'success',
+            message: `EPC 0x${epcNum.toString(16).toUpperCase()} set to ${value} on EOJ 0x${destinationEoj.groupCode.toString(16).toUpperCase()} 0x${destinationEoj.classCode.toString(16).toUpperCase()} 0x${destinationEoj.instanceId.toString(16).toUpperCase()}`,
+            details: {
+              host,
+              eoj: destinationEoj,
+              epc: `0x${epcNum.toString(16).toUpperCase()}`,
+              value: value,
+              rawBytes: pvBytes.map(b => `0x${b.toString(16).padStart(2, '0').toUpperCase()}`).join(' '),
+            }
+          }, null, 2) 
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to set EPC: ${(err as Error).message}` }],
         isError: true,
       };
     }
@@ -489,46 +719,54 @@ server.registerTool(
         const bytes = Array.from(epcDataItem.pv);
         const props: { epc: string; epcNum: number; name?: string; shortName?: string; description?: string }[] = [];
 
-        // If payload is short (< 17 bytes), just return the raw data without first byte
+        // Load MRA lookup for this EOJ once (shared by all EPCs)
+        const mraCache = loadMraData();
+        const mraLookup = mraCache.get(eojKey);
+
         if (bytes.length < 17) {
+          // Short format: each byte after index 0 is a direct EPC code
           for (let i = 1; i < bytes.length; i++) {
             const epcNum = bytes[i];
+            const epcHex = `0x${epcNum.toString(16).toUpperCase()}`;
+            
+            // Enrich with MRA property info if available
+            let propInfo: { name: string; shortName: string; accessRule: any; description?: string } | undefined;
+            if (mraLookup) {
+              propInfo = mraLookup.properties.get(epcNum);
+            }
+
             props.push({ 
-              epc: `0x${epcNum.toString(16).toUpperCase()}`, 
+              epc: epcHex, 
               epcNum,
-              name: undefined
+              name: propInfo?.name || undefined,
+              shortName: propInfo?.shortName || undefined,
+              description: propInfo?.description || undefined,
             });
           }
-          return props;
-        }
+        } else {
+          // Bitmap format (_009X): each byte encodes 8 EPCs
+          for (let i = 1; i < bytes.length; i++) {
+            const code = i - 1;
+            const byteVal = bytes[i];
+            for (let j = 0; j < 8; j++) {
+              if (byteVal & (1 << j)) {
+                const epcNum = (j + 8) * 16 + code;
+                const epcHex = `0x${epcNum.toString(16).toUpperCase()}`;
+                
+                // Enrich with MRA property info if available
+                let propInfo: { name: string; shortName: string; accessRule: any; description?: string } | undefined;
+                if (mraLookup) {
+                  propInfo = mraLookup.properties.get(epcNum);
+                }
 
-        // Parse bitmap format (_009X): each byte encodes 8 EPCs
-        for (let i = 1; i < bytes.length; i++) {
-          const code = i - 1;
-          const byteVal = bytes[i];
-          for (let j = 0; j < 8; j++) {
-            if (byteVal & (1 << j)) {
-              const epcNum = (j + 8) * 16 + code;
-              props.push({ 
-                epc: `0x${epcNum.toString(16).toUpperCase()}`, 
-                epcNum,
-                name: undefined
-              });
-            }
-          }
-        }
-
-        // Enrich with MRA property names
-        const mraCache = loadMraData();
-        const lookup = mraCache.get(eojKey);
-        
-        for (const prop of props) {
-          if (lookup) {
-            const propInfo = lookup.properties.get(prop.epcNum);
-            if (propInfo) {
-              prop.name = propInfo.name;
-              prop.shortName = propInfo.shortName;
-              prop.description = propInfo.description;
+                props.push({ 
+                  epc: epcHex, 
+                  epcNum,
+                  name: propInfo?.name || undefined,
+                  shortName: propInfo?.shortName || undefined,
+                  description: propInfo?.description || undefined,
+                });
+              }
             }
           }
         }

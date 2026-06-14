@@ -5,7 +5,7 @@
 [![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-green.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)](https://www.typescriptlang.org/)
 
-An MCP (Model Context Protocol) server for **ECHONETLite** home automation — control air conditioners and read sensors via the Model Context Protocol.
+An MCP (Model Context Protocol) server for **ECHONETLite** home automation — control air conditioners, discover devices, and read sensors via the Model Context Protocol.
 
 > ECHONETLite is a Japanese IoT protocol widely used in smart home devices, particularly HVAC systems by major manufacturers like Daikin, Panasonic, Mitsubishi Electric, and Toshiba.
 
@@ -14,18 +14,19 @@ An MCP (Model Context Protocol) server for **ECHONETLite** home automation — c
 - 🌡️ **Real-time HVAC monitoring** — temperature, humidity, operating status
 - ❄️ **Full climate control** — mode, fan speed, airflow direction, swing
 - 🔍 **Network device discovery** — find ECHONETLite devices via multicast UDP
+- 🔬 **Node Profile probing** — discover manufacturer, product code, UID, and all EOJ instances on any device
 - ⚡ **Real-time notifications** — async updates from device multicast listeners
 - 📖 **MRA enrichment** — Machine Readable Index integration for property names, descriptions, and value decoding
 - 🔬 **EPC introspection** — query property maps (STATMAP/SETMAP/GETMAP) with MRA-based names
 - 🏷️ **Human-readable values** — raw EPC values decoded to human-friendly format using MRA definitions
 - 🎯 **Multi-EPC queries** — query multiple EPC codes in a single request
-- 🔧 **Generic EOJ support** — query any ECHONETLite object by group/class/instance codes
+- 🔧 **Generic EOJ support** — set/query any ECHONETLite object by group/class/instance codes
 - 📦 **TypeScript-first** — full type definitions included
 - 🔌 **MCP compatible** — works with any MCP client (Claude Desktop, LM Studio, VS Code extensions, etc.)
 
 ## Prerequisites
 
-- Node.js 18+ 
+- Node.js 18+
 - An ECHONETLite-compatible device on the same local network
 
 ## Installation
@@ -109,7 +110,7 @@ Add to your Claude Desktop MCP configuration (`claude_desktop_config.json`):
 
 LM Studio supports MCP servers via stdio transport. Create or edit the MCP config file:
 
-**Windows:** `%APPDATA%\lm-studio\mcp_config.json`  
+**Windows:** `%APPDATA%\lm-studio\mcp_config.json`
 **macOS/Linux:** `~/.config/lm-studio/mcp_config.json`
 
 ```json
@@ -117,7 +118,7 @@ LM Studio supports MCP servers via stdio transport. Create or edit the MCP confi
   "mcpServers": {
     "echonetlite-mcp": {
       "command": "node",
-      "args": ["C:\\path\\to\\echonetlite-mcp\\dist\\index.js"],
+      "args": ["C:\\path\\to\\echonetlite-mcp\\dist/index.js"],
       "env": {
         "ECHONET_DEFAULT_HOST": "192.168.1.6"
       }
@@ -151,7 +152,8 @@ Configure in your VS Code MCP extension settings:
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `discover_devices` | Discover all ECHONETLite devices on the local network | `timeout` (optional) - Discovery timeout in ms (default: 3000) |
+| `discover_devices` | Discover all ECHONETLite devices on the local network via multicast | `timeout` (optional) - Discovery timeout in ms (default: 3000) |
+| `discover_nodes` | Active Node Profile probing of a specific device — discovers manufacturer, product code, UID, and all EOJ instances with MRA enrichment | `host` (required), `timeout` (optional) |
 
 ### HVAC Control
 
@@ -182,7 +184,8 @@ Configure in your VS Code MCP extension settings:
 |------|-------------|------------|
 | `get_property_maps` | Query STATMAP/SETMAP/GETMAP with MRA-based property names and descriptions | `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
 | `query_epc` | Query one or more EPC codes from device, returns raw + human-readable decoded values | `epcs` (required), `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
-| `get_epc_definition` | Get MRA definition for EPC codes without querying the device — includes enum values, bitmaps, level ranges | `epcs` (required), `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
+| `get_epc_definition` | Get MRA definition for EPC codes without querying the device — includes enum values, bitmaps, level ranges, $ref-resolved definitions | `epcs` (required), `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
+| `set_epc` | Generic EPC setter — set any writable property on any EOJ instance by hex value | `host`, `eojgc`, `eojcc`, `eojInstance`, `epc`, `value` |
 
 ### Device Configuration
 
@@ -240,13 +243,14 @@ Try these natural language prompts with your MCP client:
 - `"What EPC codes can I query on this device?"` → calls `get_property_maps`
 - `"Get the current operation status and target temperature"` → calls `query_epc` with `epcs=["0x80", "0xB3"]`
 - `"What settings are available for operating mode?"` → calls `get_epc_definition` with `epcs=["0xB0"]`
+- `"Discover all nodes on 192.168.1.6"` → calls `discover_nodes` with full MRA enrichment
 
 ## Project Structure
 
 ```
 echonetlite-mcp/
 ├── src/
-│   ├── index.ts              # MCP server entry point & tool definitions
+│   ├── index.ts              # MCP server entry point & tool definitions (~1150 lines)
 │   ├── echonetlite.ts        # ECHONETLite client wrapper (UDP communication)
 │   ├── mra.ts                # MRA (Machine Readable Index) data loader & decoders
 │   ├── devices/
@@ -283,13 +287,16 @@ node dist/index.js
 
 ## MRA Integration
 
-This server includes MRA (Machine Readable Index) data for rich property metadata:
-- **Property names & descriptions** — human-readable labels for each EPC code
-- **Value decoding** — raw hex values decoded to meaningful strings/numbers using MRA definitions
-- **Enum/bitmap support** — full enumeration of possible values for settable properties
-- **$ref resolution** — external definition references are resolved automatically
+This server includes full MRA (Machine Readable Index) data integration:
 
-The MRA data enables tools like `query_epc` and `get_epc_definition` to return enriched responses without manual value mapping.
+- **Property names & descriptions** — human-readable labels for each EPC code from MRA definitions
+- **Value decoding** — raw hex values decoded to meaningful strings/numbers using MRA type schemas
+- **Enum/bitmap support** — full enumeration of possible values with $ref resolution
+- **Level ranges & number formats** — signed/unsigned integers, fixed-point decimals
+- **$ref resolution** — external definition references from definitions.json resolved automatically
+- **MRA enrichment in all tools** — `query_epc`, `get_property_maps`, `get_epc_definition` return enriched responses
+
+The MRA data enables intelligent discovery of what settings are available for any EPC code without needing to query the device first.
 
 ## References
 
@@ -306,4 +313,4 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 For issues, questions, or contributions, please open an issue on [GitHub](https://github.com/scottyphillips/echonetlite-mcp/issues).
 
-[![Buy Me A Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://www.buymeacoffee.com/rgkwqyt)
+[![Buy Me A Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://www.buymeacoffee.com/rgkwyt)
