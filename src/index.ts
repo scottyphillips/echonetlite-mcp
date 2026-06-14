@@ -8,7 +8,7 @@ import { EchonetLiteClient } from './echonetlite.js';
 import { HomeAirConditioner } from './devices/homeAirConditioner.js';
 import { DEFAULT_HOST, HVAC_EOJGC, HVAC_EOJCC, HVAC_EOJ_INSTANCE } from './config.js';
 import type { HvacStatus, DiscoveredDevice, Eoj } from './types.js';
-import { loadMraData, buildEojKey, getEojName } from './mra.js';
+import { loadMraData, buildEojKey, getEojName, decodeEpcValue, getPropertyInfo, getRawMraPropertyData, loadDefinitions, resolveRef } from './mra.js';
 
 // ============================================================================
 // Global State
@@ -554,6 +554,244 @@ server.registerTool(
     } catch (err) {
       return {
         content: [{ type: 'text', text: `Property maps query failed: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Query one or more EPC codes from device and return raw + human-readable values */
+server.registerTool(
+  'query_epc',
+  {
+    description: 'Query one or more EPC (EPC Property Code) codes from an actual ECHONETLite device and return the current raw value and human-readable decoded value. Sends a GET request to the device with all requested EPCs, receives the actual values, then decodes each using MRA enrichment data. Returns property name, short name, description, access rules, decoded human-readable value, and raw hex value for each EPC.',
+    inputSchema: {
+      epcs: z.array(z.string()).describe('EPC codes in hex format (e.g., ["0xBB", "0xB3"] for temperatures, ["0x80"] for operation status). Supports multiple EPCs in a single query.'),
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      eojgc: z.string().optional().describe('EOJ Group Code in hex (e.g., "0x01") (default: 0x01 for HVAC)'),
+      eojcc: z.string().optional().describe('EOJ Class Code in hex (e.g., "0x30") (default: 0x30 for home air conditioner)'),
+      eojInstance: z.string().optional().describe('EOJ Instance ID in hex (e.g., "0x01") (default: 0x01)'),
+    },
+  },
+  async ({ epcs, host, eojgc, eojcc, eojInstance }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+
+      // Parse EPCs from hex strings and validate
+      const epcNums: number[] = [];
+      const invalidEpcs: string[] = [];
+      for (const epc of epcs) {
+        const epcNum = parseInt(epc.replace('0x', ''), 16);
+        if (isNaN(epcNum)) {
+          invalidEpcs.push(epc);
+        } else {
+          epcNums.push(epcNum);
+        }
+      }
+
+      if (invalidEpcs.length > 0) {
+        return {
+          content: [{ type: 'text', text: `Invalid EPC codes: ${invalidEpcs.join(', ')}` }],
+          isError: true,
+        };
+      }
+
+      // Parse EOJ components or use default HVAC
+      const gc = eojgc ? parseInt(eojgc.replace('0x', ''), 16) : 0x01;
+      const cc = eojcc ? parseInt(eojcc.replace('0x', ''), 16) : 0x30;
+      const inst = eojInstance ? parseInt(eojInstance.replace('0x', ''), 16) : 0x01;
+      const eojKey = buildEojKey(gc, cc);
+      
+      const destinationEoj: Eoj = {
+        groupCode: gc,
+        classCode: cc,
+        instanceId: inst,
+      };
+
+      // Query the actual device for all EPC values in one request
+      const epcData = await client.get(targetHost, epcNums, destinationEoj);
+      
+      if (!epcData || epcData.length === 0) {
+        return {
+          content: [{ type: 'text', text: `No response from device for EPCs: ${epcs.join(', ')}` }],
+          isError: true,
+        };
+      }
+
+      // Build results for each requested EPC
+      const results = epcNums.map((epcNum) => {
+        // Find the response for this EPC
+        const responseData = epcData.find(d => d.epc === epcNum);
+        
+        if (!responseData) {
+          return {
+            epc: `0x${epcNum.toString(16).toUpperCase()}`,
+            error: 'No response from device',
+          };
+        }
+
+        const pv = responseData.pv; // The actual value bytes from device
+
+        // Get property info from MRA
+        const propInfo = getPropertyInfo(eojKey, epcNum);
+        
+        if (!propInfo) {
+          return {
+            epc: `0x${epcNum.toString(16).toUpperCase()}`,
+            error: `EPC not found in MRA for EOJ ${eojKey}`,
+            eoJName: getEojName(eojKey),
+            deviceResponse: {
+              accessCapability: responseData.ac ? `0x${responseData.ac.toString(16).toUpperCase()}` : 'unknown',
+              rawValue: Array.from(pv).map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`).join(' '),
+            }
+          };
+        }
+
+        // Decode the value using MRA as source of truth
+        let humanReadableValue = '(decode failed)';
+        let rawHexValue = '';
+        
+        if (pv && pv.length > 0) {
+          const decoded = decodeEpcValue(epcNum, pv, eojKey);
+          if (decoded) {
+            humanReadableValue = decoded.humanReadableValue;
+            rawHexValue = decoded.rawValue;
+          } else {
+            rawHexValue = Array.from(pv).map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`).join(' ');
+          }
+        }
+
+        return {
+          epc: `0x${epcNum.toString(16).toUpperCase()}`,
+          propertyName: propInfo.name,
+          shortName: propInfo.shortName,
+          description: propInfo.description,
+          accessRule: propInfo.accessRule,
+          value: {
+            rawHex: rawHexValue || '(no data)',
+            humanReadable: humanReadableValue,
+            accessCapability: responseData.ac ? `0x${responseData.ac.toString(16).toUpperCase()}` : 'unknown',
+          },
+        };
+      });
+
+      const output = {
+        device: {
+          host: targetHost,
+          eoj: destinationEoj,
+          eojKey: eojKey,
+          eoJName: getEojName(eojKey),
+        },
+        requestedEpcs: epcs,
+        results,
+      };
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `EPC query failed: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Get EPC definition from MRA - returns property metadata and full definition with all possible values/settings */
+server.registerTool(
+  'get_epc_definition',
+  {
+    description: 'Get the ECHONETLite MRA (Machine Readable Index) definition for one or more EPC codes without querying the device. Returns property name, short name, description, access rules (GET/SET/INF capabilities), and the full MRA definition data including all possible enum values, bitmaps, level ranges, number formats, units, and $ref-resolved definitions. Useful for discovering what settings are available for a given EPC.',
+    inputSchema: {
+      epcs: z.array(z.string()).describe('EPC codes in hex format (e.g., ["0xB0"] for operating mode, ["0xA0"] for air flow rate). Supports multiple EPCs.'),
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST}) - used to determine EOJ type`),
+      eojgc: z.string().optional().describe('EOJ Group Code in hex (e.g., "0x01") (default: 0x01 for HVAC)'),
+      eojcc: z.string().optional().describe('EOJ Class Code in hex (e.g., "0x30") (default: 0x30 for home air conditioner)'),
+      eojInstance: z.string().optional().describe('EOJ Instance ID in hex (e.g., "0x01") (default: 0x01)'),
+    },
+  },
+  async ({ epcs, host, eojgc, eojcc, eojInstance }) => {
+    try {
+      const targetHost = host || DEFAULT_HOST;
+
+      // Parse EPCs from hex strings and validate
+      const epcNums: number[] = [];
+      const invalidEpcs: string[] = [];
+      for (const epc of epcs) {
+        const epcNum = parseInt(epc.replace('0x', ''), 16);
+        if (isNaN(epcNum)) {
+          invalidEpcs.push(epc);
+        } else {
+          epcNums.push(epcNum);
+        }
+      }
+
+      if (invalidEpcs.length > 0) {
+        return {
+          content: [{ type: 'text', text: `Invalid EPC codes: ${invalidEpcs.join(', ')}` }],
+          isError: true,
+        };
+      }
+
+      // Parse EOJ components or use default HVAC
+      const gc = eojgc ? parseInt(eojgc.replace('0x', ''), 16) : 0x01;
+      const cc = eojcc ? parseInt(eojcc.replace('0x', ''), 16) : 0x30;
+      const inst = eojInstance ? parseInt(eojInstance.replace('0x', ''), 16) : 0x01;
+      const eojKey = buildEojKey(gc, cc);
+      
+      // Build results for each requested EPC - MRA lookup only (no device query)
+      const results = epcNums.map((epcNum) => {
+        // Get property info from MRA
+        const propInfo = getPropertyInfo(eojKey, epcNum);
+        
+        if (!propInfo) {
+          return {
+            epc: `0x${epcNum.toString(16).toUpperCase()}`,
+            error: `EPC not found in MRA for EOJ ${eojKey}`,
+            eoJName: getEojName(eojKey),
+          };
+        }
+
+        // Get raw MRA data for value decoding (includes $ref, type, oneOf, bitmaps, etc.)
+        const rawData = getRawMraPropertyData(epcNum, eojKey);
+
+        // Resolve the full definition from definitions.json if $ref exists
+        let resolvedDefinition: any = null;
+        if (rawData?.$ref) {
+          resolvedDefinition = resolveRef(rawData.$ref);
+        }
+
+        return {
+          epc: `0x${epcNum.toString(16).toUpperCase()}`,
+          propertyName: propInfo.name,
+          shortName: propInfo.shortName,
+          description: propInfo.description,
+          accessRule: propInfo.accessRule,
+          mraEnrichment: {
+            propertyData: rawData || null,
+            ref: rawData?.$ref || null,
+            definition: resolvedDefinition || null,
+          },
+        };
+      });
+
+      const output = {
+        device: {
+          host: targetHost,
+          eojKey: eojKey,
+          eoJName: getEojName(eojKey),
+        },
+        requestedEpcs: epcs,
+        results,
+      };
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `EPC definition lookup failed: ${(err as Error).message}` }],
         isError: true,
       };
     }
