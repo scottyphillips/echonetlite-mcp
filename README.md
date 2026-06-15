@@ -19,6 +19,7 @@ An MCP (Model Context Protocol) server for **ECHONETLite** home automation — c
 - 📖 **MRA enrichment** — Machine Readable Index integration for property names, descriptions, and value decoding
 - 🔬 **EPC introspection** — query property maps (STATMAP/SETMAP/GETMAP) with MRA-based names
 - 🏷️ **Human-readable values** — raw EPC values decoded to human-friendly format using MRA definitions
+- 🧩 **EPC element parsing** — parse complex object/array-type EPC values into named elements with MRA definitions
 - 🎯 **Multi-EPC queries** — query multiple EPC codes in a single request
 - 🔧 **Generic EOJ support** — set/query any ECHONETLite object by group/class/instance codes
 - 📦 **TypeScript-first** — full type definitions included
@@ -217,15 +218,7 @@ Configure in your VS Code MCP extension settings:
 | `query_epc` | Query one or more EPC codes from device, returns raw + human-readable decoded values | `epcs` (required), `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
 | `get_epc_definition` | Get MRA definition for EPC codes without querying the device — includes enum values, bitmaps, level ranges, $ref-resolved definitions | `epcs` (required), `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
 | `set_epc` | Generic EPC setter — set any writable property on any EOJ instance by hex value | `host`, `eojgc`, `eojcc`, `eojInstance`, `epc`, `value` |
-
-### Device Configuration (Full Mode Only)
-
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `set_swing_mode` | Set air swing/swing mode function | `host`, `mode` ("not-used" / "vert" / "horiz" / "vert-horiz") |
-| `set_auto_direction` | Set automatic airflow direction mode | `host`, `mode` ("auto" / "non-auto" / "auto-vert" / "auto-horiz") |
-| `set_silent_mode` | Set silent operation mode | `host`, `mode` ("normal" / "high-speed" / "silent") |
-| `set_power_saving` | Set power-saving mode | `host`, `state` ("saving" / "normal") |
+| `parse_epc_elements` | Parse object/array-type EPC values into named elements with raw hex bytes per element — use after querying EPC data (e.g., 0xE2) to get structured breakdown | `epc` (required), `rawHex` (required), `host`, `eojgc`, `eojcc`, `eojInstance`, `propertyName`, `shortName` (all optional) |
 
 ## Available Resources
 
@@ -275,6 +268,7 @@ Try these natural language prompts with your MCP client:
 - `"Get the current operation status and target temperature"` → calls `query_epc` with `epcs=["0x80", "0xB3"]`
 - `"What settings are available for operating mode?"` → calls `get_epc_definition` with `epcs=["0xB0"]`
 - `"Discover all nodes on 192.168.1.6"` → calls `discover_nodes` with full MRA enrichment
+- `"Parse the EPC 0xE2 value 0x00 0x0A 0xFF 0xFF for EOJ 0x02 0x88 0x01"` → calls `parse_epc_elements` to split raw bytes into named elements
 
 ## Project Structure
 

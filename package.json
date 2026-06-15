@@ -13,7 +13,11 @@
     "build": "node bundler.mjs && tsc",
     "prepublishOnly": "npm run build",
     "start": "node dist/index.js",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "node tests/mra.test.mjs && node tests/device.test.mjs && node tests/mcp.test.mjs",
+    "test:mra": "node tests/mra.test.mjs",
+    "test:device": "node tests/device.test.mjs",
+    "test:mcp": "node tests/mcp.test.mjs"
   },
   "keywords": [
     "echonetlite",
