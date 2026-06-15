@@ -91,8 +91,29 @@ function bundleMraData() {
   }
   fs.writeFileSync(distFile, output);
   
-  const fileCount = Object.keys(bundled).length;
-  console.log(`Bundled ${fileCount} files -> ${Math.round(output.length / 1024)}KB`);
+  // Bundle manufacturers.json into the same output file
+  const manufacturersPath = path.join(__dirname, 'src', 'manufactorers.json');
+  if (fs.existsSync(manufacturersPath)) {
+    try {
+      const manufacturersContent = JSON.parse(fs.readFileSync(manufacturersPath, 'utf-8'));
+      bundled['manufactorers.json'] = manufacturersContent;
+      
+      // Rewrite output with embedded manufacturers data
+      const newOutput = JSON.stringify({ version: '1.0', files: bundled }, null, 2);
+      fs.writeFileSync(BUNDLED_FILE, newOutput);
+      fs.writeFileSync(distFile, newOutput);
+      
+      console.log(`Bundled ${Object.keys(bundled).length} files -> ${Math.round(newOutput.length / 1024)}KB`);
+    } catch (e) {
+      console.error(`Warning: Failed to bundle manufacturers.json: ${e.message}`);
+      const fileCount = Object.keys(bundled).length;
+      console.log(`Bundled ${fileCount} files -> ${Math.round(output.length / 1024)}KB`);
+    }
+  } else {
+    const fileCount = Object.keys(bundled).length;
+    console.log(`Bundled ${fileCount} files -> ${Math.round(output.length / 1024)}KB`);
+  }
+  
   return bundled;
 }
 

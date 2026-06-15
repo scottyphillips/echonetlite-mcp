@@ -130,6 +130,42 @@ let superClassPropsCache: Map<number, { name: string; shortName: string; accessR
 let propertyCache: Map<string, PropertyLookup> | null = null;
 let definitionsCache: any = null;
 
+// ============================================================================
+// Embedded Manufacturer Data (for EPC 0x8A enrichment)
+// ============================================================================
+
+/** Manufacturer code lookup map: hex key → company name */
+export interface ManufacturerMap {
+  [key: string]: string;
+}
+
+let manufacturersCache: ManufacturerMap | null = null;
+
+/** Load embedded manufacturer data from bundled JSON */
+export function loadManufacturers(): ManufacturerMap {
+  if (manufacturersCache !== null) {
+    return manufacturersCache;
+  }
+  
+  manufacturersCache = {};
+  
+  try {
+    const bundled = loadBundledMraData();
+    if (!bundled) return manufacturersCache;
+    
+    // Check for embedded manufacturers.json in bundled data
+    const embeddedManufacturers = bundled.files['manufactorers.json'];
+    if (embeddedManufacturers && typeof embeddedManufacturers === 'object') {
+      manufacturersCache = embeddedManufacturers as ManufacturerMap;
+      return manufacturersCache;
+    }
+  } catch {
+    // Fall back to empty map
+  }
+  
+  return manufacturersCache;
+}
+
 /** Build EOJ key from components */
 export function buildEojKey(gc: number, cc: number, inst?: number): string {
   return `0x${gc.toString(16).padStart(2, '0').toUpperCase()}${cc.toString(16).padStart(2, '0').toUpperCase()}`;

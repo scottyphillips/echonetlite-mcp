@@ -487,8 +487,17 @@ export class EchonetLiteClient {
     const discovered: DiscoveredDevice[] = [];
     const seenHosts = new Set<string>();
 
+    // Filter out responses from our own MCP server by checking the Source EOJ.
+    // Our packets use DEFAULT_SEOJ_GROUP (0x05) as the source group code.
+    // Any response originating from our own ECHONETLite stack will have this SEOJ.
     const discoverListener = (packet: EchonetPacket, info: { address: string; port: number }) => {
       const host = info.address;
+      
+      // Skip responses from our own MCP server (SEOJ group code matches DEFAULT_SEOJ_GROUP)
+      if (packet.sourceEoj.groupCode === DEFAULT_SEOJ_GROUP) {
+        return;
+      }
+      
       if (!seenHosts.has(host)) {
         seenHosts.add(host);
         discovered.push({
@@ -501,13 +510,15 @@ export class EchonetLiteClient {
 
     this.notificationListeners.add(discoverListener);
 
-    // Discovery request to multicast
+    // Discovery request to multicast - uses Node Profile Class (0x0E 0xF0) 
+    // to discover all devices on the network via their Node Profile responses.
+    // This matches the same destination EOJ used by discoverDevice/discover_nodes.
     const discoverPacket: EchonetPacket = {
       header: { echonetVersion: [0x10, 0x81], tid: 0 },
       sourceEoj: { groupCode: DEFAULT_SEOJ_GROUP, classCode: DEFAULT_SEOJ_CLASS, instanceId: 0xff },
-      destinationEoj: { groupCode: 0x01, classCode: 0x30, instanceId: 0x01 },
+      destinationEoj: { groupCode: NODE_PROFILE_GROUP, classCode: NODE_PROFILE_CLASS, instanceId: 0x01 },
       operation: 'get',
-      epcData: [{ epc: 0xe0, pv: new Uint8Array([0x01]), ac: 4 }],
+      epcData: [{ epc: EPC_INSTANCE_LIST, pv: new Uint8Array([]), ac: 4 }],
     };
 
     const buffer = buildPacketBuffer(discoverPacket);
@@ -523,10 +534,10 @@ export class EchonetLiteClient {
       }
     }
 
-    // Also send to broadcast
+    // Also send to broadcast address using Node Profile Class destination
     const broadcastBuffer = buildPacketBuffer({
       ...discoverPacket,
-      destinationEoj: { groupCode: 0x01, classCode: 0xff, instanceId: 0xff },
+      destinationEoj: { groupCode: NODE_PROFILE_GROUP, classCode: NODE_PROFILE_CLASS, instanceId: 0xFF },
     });
 
     await new Promise<void>((resolve) => {
@@ -644,7 +655,7 @@ export class EchonetLiteClient {
       destinationEoj: destinationEoj || { groupCode: 0x01, classCode: 0x30, instanceId: 0x01 },
       operation: 'get',
       epcData: [
-        { epc: 0x9d, pv: new Uint8Array([]), ac: 4 },  // STATMAP - access capability map
+        { epc: 0x9d, pv: new Uint8Array([]), ac: 4 },  // STATMAP - status change announcement EPCs
         { epc: 0x9e, pv: new Uint8Array([]), ac: 4 },  // SETMAP - settable properties
         { epc: 0x9f, pv: new Uint8Array([]), ac: 4 },  // GETMAP - readable properties
       ],

@@ -8,7 +8,26 @@ import { EchonetLiteClient } from './echonetlite.js';
 import { HomeAirConditioner } from './devices/homeAirConditioner.js';
 import { DEFAULT_HOST, HVAC_EOJGC, HVAC_EOJCC, HVAC_EOJ_INSTANCE, LITE_MODE } from './config.js';
 import type { HvacStatus, DiscoveredDevice, Eoj, NodeProfileData, DiscoveredDeviceFull } from './types.js';
-import { loadMraData, buildEojKey, getEojName, decodeEpcValue, getPropertyInfo, getRawMraPropertyData, loadDefinitions, resolveRef, getCoefficientRule, getAllCoefficientRules, getAllComplexRules, parseEpcElementsResult, DecodedEpcValue } from './mra.js';
+import { loadMraData, buildEojKey, getEojName, decodeEpcValue, getPropertyInfo, getRawMraPropertyData, loadDefinitions, resolveRef, getCoefficientRule, getAllCoefficientRules, getAllComplexRules, parseEpcElementsResult, DecodedEpcValue, loadManufacturers } from './mra.js';
+
+// ============================================================================
+// Manufacturer Code Lookup (for EPC 0x8A enrichment)
+// Uses embedded manufacturer data from bundled JSON (same as MRA data).
+// ============================================================================
+
+/**
+ * Look up a 3-byte manufacturer code (EPC 0x8A format) in the embedded manufacturers.json.
+ * The raw value is 3 bytes big-endian. We convert to UPPERCASE hex key matching JSON keys like "0x00000B".
+ */
+function lookupManufacturerName(pv: Uint8Array): string | null {
+  if (!pv || pv.length === 0) return null;
+  
+  // Generate UPPERCASE hex key to match manufacturers.json format (e.g., "0x000006")
+  const hexKey = `0x${Array.from(pv).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join('')}`;
+  const manufacturers = loadManufacturers();
+  
+  return manufacturers[hexKey] || null;
+}
 
 // ============================================================================
 // Global State
@@ -90,6 +109,27 @@ server.registerTool(
       const device: DiscoveredDeviceFull = await client.discoverDevice(targetHost, discoveryTimeout);
       const mraData = loadMraData() ?? new Map();
       
+      // Look up manufacturer name from embedded manufacturers.json
+      const nodeProfile = device.nodeProfile;
+      let manufacturerName: string | undefined = undefined;
+      if (nodeProfile?.manufacturer && nodeProfile.manufacturer.length > 0) {
+        const rawManufacturer = new Uint8Array(nodeProfile.manufacturer);
+        // Pad to 3 bytes if needed for EPC 0x8A format lookup
+        const mfrBytes = rawManufacturer.length >= 3 
+          ? rawManufacturer.slice(0, 3) 
+          : (() => {
+              const padded = new Uint8Array(3);
+              for (let i = 0; i < rawManufacturer.length; i++) {
+                padded[i + (3 - rawManufacturer.length)] = rawManufacturer[i];
+              }
+              return padded;
+            })();
+        const found = lookupManufacturerName(mfrBytes);
+        if (found) {
+          manufacturerName = found;
+        }
+      }
+
       const formattedResult = {
         host: device.host,
         discoveryMethod: device.discoveryMethod,
@@ -98,6 +138,7 @@ server.registerTool(
           manufacturer: device.nodeProfile.manufacturer 
             ? `0x${Array.from(device.nodeProfile.manufacturer).map(b => b.toString(16).padStart(2, '0')).join(' ')}`
             : undefined,
+          manufacturerName: manufacturerName,
           productCode: device.nodeProfile.productCode
             ? `0x${Array.from(device.nodeProfile.productCode).map(b => b.toString(16).padStart(2, '0')).join(' ')}`
             : undefined,
@@ -269,7 +310,7 @@ server.registerTool(
 server.registerTool(
   'get_property_maps',
   {
-    description: 'Query all property maps (STATMAP/SETMAP/GETMAP) of an ECHONETLite object using standardized EPCs 0x9D, 0x9E, 0x9F. Returns the access capability map (STATMAP), settable properties (SETMAP), and readable properties (GETMAP) with MRA-based property names and descriptions.',
+    description: 'Query all property maps (STATMAP/SETMAP/GETMAP) of an ECHONETLite object using standardized EPCs 0x9D, 0x9E, 0x9F. Returns the status change announcement EPC list (STATMAP), settable properties (SETMAP), and readable properties (GETMAP) with MRA-based property names and descriptions.',
     inputSchema: {
       host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
       eojgc: z.string().optional().describe('EOJ Group Code in hex (e.g., "0x01")'),
@@ -359,7 +400,7 @@ server.registerTool(
           statmap: parsePropertyMap(statmapData || { epc: 0x9d, pv: new Uint8Array([]) }),
           setmap: parsePropertyMap(setmapData || { epc: 0x9e, pv: new Uint8Array([]) }),
           getmap: parsePropertyMap(getmapData || { epc: 0x9f, pv: new Uint8Array([]) }),
-          description: 'STATMAP(0x9D)=access capability, SETMAP(0x9E)=settable props, GETMAP(0x9F)=readable props.'
+          description: 'STATMAP(0x9D)=status notification EPCs, SETMAP(0x9E)=settable props, GETMAP(0x9F)=readable props.'
         }, null, 2) }],
       };
     } catch (err) {
@@ -483,6 +524,16 @@ server.registerTool(
             accessCapability: responseData.ac ? `0x${responseData.ac.toString(16).toUpperCase()}` : 'unknown',
           },
         };
+
+        // Enrich EPC 0x8A (Manufacturer) with manufacturer name from embedded manufacturers.json
+        if (epcNum === 0x8a && pv && pv.length > 0) {
+          const manufacturerName = lookupManufacturerName(pv);
+          if (manufacturerName) {
+            // Override humanReadable with the manufacturer name for easy access
+            result.value.humanReadable = manufacturerName;
+            result.manufacturer = manufacturerName;
+          }
+        }
 
         // Add coefficient rule if present - LLMs need this to calculate actual values
         if (coefficientRule) {
