@@ -33,6 +33,42 @@ interface PropertyLookup {
   properties: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }>;
 }
 
+// ============================================================================
+// Coefficient Rule Types
+// ============================================================================
+
+/** Represents a coefficient relationship between EPCs */
+export interface CoefficientRule {
+  /** The EPC code that requires coefficient application */
+  sourceEpc: number;
+  /** Source property short name for context */
+  sourceShortName: string;
+  /** Source property name for context */
+  sourcePropertyName: string;
+  /** List of coefficient EPCs to multiply by */
+  coefficientEpcs: number[];
+  /** Coefficient property details */
+  coefficientDetails: {
+    epc: number;
+    shortName: string;
+    propertyName: string;
+  }[];
+  /** Human-readable instruction for LLMs */
+  instruction: string;
+  /** The note from the MRA definition explaining the coefficient relationship */
+  note?: string;
+}
+
+/** Represents a complex property rule that requires additional context */
+export interface ComplexPropertyRule {
+  epc: number;
+  shortName: string;
+  propertyName: string;
+  ruleType: 'coefficient' | 'atomic' | 'conditional' | 'array';
+  metadata: Record<string, any>;
+  hints: string[];
+}
+
 // Cache for superclass properties (loaded once from 0x0000.json, shared by all devices)
 let superClassPropsCache: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> | null = null;
 
@@ -218,6 +254,310 @@ export function getEojName(eojKey: string, mraDir?: string): string {
   return lookup ? lookup.eoJName : eojKey;
 }
 
+// ============================================================================
+// Coefficient Extraction Functions
+// ============================================================================
+
+/**
+ * Extract coefficient EPCs from raw data definition.
+ * Scans the data structure for "coefficient" arrays at any nesting level.
+ * Returns unique coefficient EPC values as numbers.
+ */
+function extractCoefficientEpcs(data: any, mraDir?: string): number[] {
+  const coefficients = new Set<number>();
+  
+  if (!data) return Array.from(coefficients);
+  
+  // Helper recursive function to scan data structures
+  function scanForCoefficients(obj: any): void {
+    if (!obj || typeof obj !== 'object') return;
+    
+    // Check for direct coefficient array
+    if (Array.isArray(obj.coefficient)) {
+      for (const coeff of obj.coefficient) {
+        const epcNum = parseInt(coeff.replace('0x', ''), 16);
+        if (!isNaN(epcNum)) {
+          coefficients.add(epcNum);
+        }
+      }
+    }
+    
+    // Recurse into nested objects and arrays
+    for (const key of Object.keys(obj)) {
+      scanForCoefficients(obj[key]);
+    }
+  }
+  
+  scanForCoefficients(data);
+  
+  return Array.from(coefficients);
+}
+
+/**
+ * Get coefficient details for a specific EPC by looking up the referenced coefficient EPCs.
+ * Returns detailed information about each coefficient including property names.
+ */
+function getCoefficientDetails(
+  sourceEpc: number, 
+  coefficientEpcs: number[], 
+  eojKey: string, 
+  mraDir?: string
+): { epc: number; shortName: string; propertyName: string }[] {
+  const cache = loadMraData(mraDir);
+  const lookup = cache.get(eojKey);
+  
+  if (!lookup) return [];
+  
+  return coefficientEpcs.map((coeffEpc) => {
+    const propInfo = lookup.properties.get(coeffEpc);
+    return {
+      epc: coeffEpc,
+      shortName: propInfo?.shortName || `epc_0x${coeffEpc.toString(16).toUpperCase()}`,
+      propertyName: propInfo?.name || `Unknown (0x${coeffEpc.toString(16).toUpperCase()})`,
+    };
+  });
+}
+
+/**
+ * Generate a human-readable instruction for LLMs about how to apply coefficients.
+ */
+function generateCoefficientInstruction(
+  sourceShortName: string,
+  coefficientDetails: { epc: number; shortName: string; propertyName: string }[],
+  note?: string
+): string {
+  const coeffNames = coefficientDetails.map(c => 
+    `${c.shortName} (EPC 0x${c.epc.toString(16).toUpperCase()})`
+  ).join(' × ');
+  
+  let instruction = `⚠️ COEFFICIENT RULE: The raw value for "${sourceShortName}" must be multiplied by:`;
+  instruction += `\n   ${coeffNames}`;
+  
+  if (note) {
+    instruction += `\n   Note: ${note}`;
+  }
+  
+  return instruction;
+}
+
+/**
+ * Get coefficient rules for a specific EPC on a device.
+ * Returns null if no coefficient relationship exists.
+ */
+export function getCoefficientRule(
+  epc: number, 
+  eojKey: string, 
+  mraDir?: string
+): CoefficientRule | null {
+  const rawData = getRawMraPropertyData(epc, eojKey, mraDir);
+  
+  if (!rawData) return null;
+  
+  // Extract coefficient EPCs from the data structure
+  const coefficientEpcs = extractCoefficientEpcs(rawData, mraDir);
+  
+  if (coefficientEpcs.length === 0) return null;
+  
+  // Load MRA data for property info
+  const cache = loadMraData(mraDir);
+  const lookup = cache.get(eojKey);
+  
+  if (!lookup) return null;
+  
+  const propInfo = lookup.properties.get(epc);
+  const sourceShortName = propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`;
+  const sourcePropertyName = propInfo?.name || `Unknown (EPC 0x${epc.toString(16).toUpperCase()})`;
+  
+  // Get coefficient details
+  const coefficientDetails = getCoefficientDetails(epc, coefficientEpcs, eojKey, mraDir);
+  
+  // Extract note from rawData or oneOf options
+  let note: string | undefined;
+  if (rawData?.note) {
+    note = rawData.note;
+  } else if (rawData?.oneOf && Array.isArray(rawData.oneOf)) {
+    for (const option of rawData.oneOf) {
+      if (option?.note) {
+        note = option.note;
+        break;
+      }
+    }
+  }
+  
+  // Generate human-readable instruction
+  const instruction = generateCoefficientInstruction(sourceShortName, coefficientDetails, note);
+  
+  return {
+    sourceEpc: epc,
+    sourceShortName,
+    sourcePropertyName,
+    coefficientEpcs,
+    coefficientDetails,
+    instruction,
+    note,
+  };
+}
+
+/**
+ * Get ALL coefficient rules for a specific EOJ type.
+ * Scans all properties and returns those with coefficient relationships.
+ */
+export function getAllCoefficientRules(
+  eojKey: string, 
+  mraDir?: string
+): CoefficientRule[] {
+  const cache = loadMraData(mraDir);
+  const lookup = cache.get(eojKey);
+  
+  if (!lookup) return [];
+  
+  const rules: CoefficientRule[] = [];
+  
+  // Scan all properties for coefficient relationships
+  for (const [epc, propInfo] of lookup.properties.entries()) {
+    const rule = getCoefficientRule(epc, eojKey, mraDir);
+    if (rule) {
+      rules.push(rule);
+    }
+  }
+  
+  return rules;
+}
+
+/**
+ * Get complex property rules for a specific EPC on a device.
+ * This includes coefficient rules, atomic operation hints, and other special patterns.
+ */
+export function getComplexPropertyRule(
+  epc: number, 
+  eojKey: string, 
+  mraDir?: string
+): ComplexPropertyRule | null {
+  const rawData = getRawMraPropertyData(epc, eojKey, mraDir);
+  
+  if (!rawData) return null;
+  
+  const cache = loadMraData(mraDir);
+  const lookup = cache.get(eojKey);
+  
+  if (!lookup) return null;
+  
+  const propInfo = lookup.properties.get(epc);
+  const hints: string[] = [];
+  const metadata: Record<string, any> = {};
+  
+  // Check for coefficient rules
+  const coeffRule = getCoefficientRule(epc, eojKey, mraDir);
+  if (coeffRule) {
+    hints.push(coeffRule.instruction);
+    metadata.coefficient = coeffRule;
+    
+    return {
+      epc,
+      shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
+      propertyName: propInfo?.name || 'Unknown',
+      ruleType: 'coefficient',
+      metadata,
+      hints,
+    };
+  }
+  
+  // Check for atomic operation relationships
+  if (rawData?.atomic) {
+    const atomicEpc = parseInt(rawData.atomic.replace('0x', ''), 16);
+    hints.push(`⚠️ ATOMIC OPERATION: EPC 0x${epc.toString(16).toUpperCase()} operates atomically with EPC 0x${atomicEpc.toString(16).toUpperCase()}. These properties must be read/written together.`);
+    metadata.atomic = { atomicEpc };
+    
+    return {
+      epc,
+      shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
+      propertyName: propInfo?.name || 'Unknown',
+      ruleType: 'atomic',
+      metadata,
+      hints,
+    };
+  }
+  
+  // Check for array properties with special structure
+  if (rawData?.type === 'array' && rawData?.itemSize) {
+    const itemSize = rawData.itemSize;
+    const minItems = rawData.minItems || 0;
+    const maxItems = rawData.maxItems || '*';
+    hints.push(`📊 ARRAY PROPERTY: This property contains ${maxItems === '*' ? 'up to' : minItems + ' to ' + maxItems} items of ${itemSize} bytes each.`);
+    metadata.array = { itemSize, minItems, maxItems };
+    
+    return {
+      epc,
+      shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
+      propertyName: propInfo?.name || 'Unknown',
+      ruleType: 'array',
+      metadata,
+      hints,
+    };
+  }
+  
+  // Check for object properties with elements that have coefficients
+  if (rawData?.type === 'object' && rawData?.properties) {
+    const elementCoefficients: number[][] = [];
+    
+    function scanObjectElements(props: any): void {
+      if (!props || !Array.isArray(props)) return;
+      for (const prop of props) {
+        if (prop?.element) {
+          const coeffs = extractCoefficientEpcs(prop.element, mraDir);
+          if (coeffs.length > 0) {
+            elementCoefficients.push(coeffs);
+          }
+        }
+        // Recurse into nested structures
+        if (prop?.element?.oneOf && Array.isArray(prop.element.oneOf)) {
+          for (const opt of prop.element.oneOf) {
+            const coeffs = extractCoefficientEpcs(opt, mraDir);
+            if (coeffs.length > 0) {
+              elementCoefficients.push(coeffs);
+            }
+          }
+        }
+      }
+    }
+    
+    scanObjectElements(rawData.properties);
+    
+    if (elementCoefficients.length > 0) {
+      // Flatten unique coefficient EPCs
+      const allCoeffEpcs = new Set<number>();
+      for (const coeffs of elementCoefficients) {
+        for (const c of coeffs) allCoeffEpcs.add(c);
+      }
+      
+      const coeffDetails = getCoefficientDetails(epc, Array.from(allCoeffEpcs), eojKey, mraDir);
+      const instruction = generateCoefficientInstruction(
+        propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
+        coeffDetails,
+        rawData.note
+      );
+      
+      hints.push(instruction);
+      metadata.coefficient = {
+        sourceEpc: epc,
+        coefficientEpcs: Array.from(allCoeffEpcs),
+        coefficientDetails: coeffDetails,
+      };
+      
+      return {
+        epc,
+        shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
+        propertyName: propInfo?.name || 'Unknown',
+        ruleType: 'coefficient',
+        metadata,
+        hints,
+      };
+    }
+  }
+  
+  return null;
+}
+
 /** Get raw MRA property data for a specific EPC from the device JSON (or superclass if not found in device-specific file) */
 export function getRawMraPropertyData(epc: number, eojKey: string, mraDir?: string): any {
   const dir = mraDir || path.join(__dirname, '..', 'mra', 'mraData');
@@ -263,17 +603,31 @@ export function getRawMraPropertyData(epc: number, eojKey: string, mraDir?: stri
 }
 
 /**
- * Decode an EPC value using MRA enrichment data.
- * Returns a human-readable value by combining the property definition (enum values, data types)
- * with the actual value bytes. Uses the MRA as the source of truth.
+ * Result of decoding an EPC value with MRA enrichment data.
+ * Includes coefficient hints for complex properties that require additional processing.
  */
-export function decodeEpcValue(epc: number | string, pv: Uint8Array | number[], eojKey: string = '0x0130', mraDir?: string): {
+export interface DecodedEpcValue {
   propertyName: string;
   shortName: string;
   description: string;
   humanReadableValue: string;
   rawValue: string;
-} | null {
+  /** Coefficient rule if this property requires multiplication by other EPC values */
+  coefficientRule?: CoefficientRule | null;
+  /** Complex property rules (coefficient, atomic, array, etc.) */
+  complexRules?: ComplexPropertyRule[] | null;
+}
+
+/**
+ * Decode an EPC value using MRA enrichment data.
+ * Returns a human-readable value by combining the property definition (enum values, data types)
+ * with the actual value bytes. Uses the MRA as the source of truth.
+ * 
+ * For complex properties like 0x0288's energy meter readings, this function automatically
+ * detects coefficient relationships and returns hints about how to properly calculate
+ * the final value by multiplying with other EPC values.
+ */
+export function decodeEpcValue(epc: number | string, pv: Uint8Array | number[], eojKey: string = '0x0130', mraDir?: string): DecodedEpcValue | null {
   // Convert EPC to number if string
   const epcNum = typeof epc === 'string' ? parseInt(epc.replace('0x', ''), 16) : epc;
   
@@ -291,13 +645,157 @@ export function decodeEpcValue(epc: number | string, pv: Uint8Array | number[], 
   // Decode the value based on MRA data structure
   const decodedValue = decodeValueFromMraData(pv, rawData, epcNum, mraDir);
   
+  // Check for coefficient rules - this is critical for energy meters and other devices
+  const coeffRule = getCoefficientRule(epcNum, eojKey, mraDir);
+  
+  // Also check for any complex property rules (atomic, array, etc.)
+  let allComplexRules: ComplexPropertyRule[] | null = null;
+  if (!coeffRule) {
+    const atomicRule = getAtomicRule(epcNum, eojKey, mraDir);
+    const arrayRule = getArrayRule(epcNum, eojKey, mraDir);
+    allComplexRules = [];
+    if (atomicRule) allComplexRules.push(atomicRule);
+    if (arrayRule) allComplexRules.push(arrayRule);
+    if (allComplexRules.length === 0) allComplexRules = null;
+  }
+  
   return {
     propertyName: propInfo.name || 'Unknown',
     shortName: propInfo.shortName || `epc_${epcNum.toString(16).toUpperCase()}`,
     description: propInfo.description || '',
     humanReadableValue: decodedValue,
     rawValue: Array.from(pv instanceof Uint8Array ? pv : new Uint8Array(pv)).map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`).join(' '),
+    coefficientRule: coeffRule || null,
+    complexRules: allComplexRules,
   };
+}
+
+// ============================================================================
+// Additional Complex Property Rule Functions
+// ============================================================================
+
+/** Get atomic operation rule for an EPC */
+function getAtomicRule(epc: number, eojKey: string, mraDir?: string): ComplexPropertyRule | null {
+  const rawData = getRawMraPropertyData(epc, eojKey, mraDir);
+  
+  if (!rawData?.atomic) return null;
+  
+  const cache = loadMraData(mraDir);
+  const lookup = cache.get(eojKey);
+  if (!lookup) return null;
+  
+  const propInfo = lookup.properties.get(epc);
+  const atomicEpc = parseInt(rawData.atomic.replace('0x', ''), 16);
+  
+  // Get the atomic partner's property info
+  const atomicPropInfo = lookup.properties.get(atomicEpc);
+  
+  return {
+    epc,
+    shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
+    propertyName: propInfo?.name || 'Unknown',
+    ruleType: 'atomic',
+    metadata: {
+      atomicEpc,
+      atomicShortName: atomicPropInfo?.shortName || `epc_0x${atomicEpc.toString(16).toUpperCase()}`,
+      atomicPropertyName: atomicPropInfo?.name || 'Unknown',
+    },
+    hints: [
+      `⚠️ ATOMIC OPERATION: EPC 0x${epc.toString(16).toUpperCase()} (${propInfo?.shortName}) operates atomically with EPC 0x${atomicEpc.toString(16).toUpperCase()} (${atomicPropInfo?.shortName}). These properties must be read/written together as a pair.`,
+      `When setting ${propInfo?.shortName}, you MUST also set ${atomicPropInfo?.shortName} in the same operation.`,
+    ],
+  };
+}
+
+/** Get array property rule for an EPC */
+function getArrayRule(epc: number, eojKey: string, mraDir?: string): ComplexPropertyRule | null {
+  const rawData = getRawMraPropertyData(epc, eojKey, mraDir);
+  
+  if (!rawData?.type || rawData.type !== 'array' || !rawData.itemSize) return null;
+  
+  const cache = loadMraData(mraDir);
+  const lookup = cache.get(eojKey);
+  if (!lookup) return null;
+  
+  const propInfo = lookup.properties.get(epc);
+  const itemSize = rawData.itemSize;
+  const minItems = rawData.minItems || 0;
+  const maxItems = rawData.maxItems || '*';
+  
+  return {
+    epc,
+    shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
+    propertyName: propInfo?.name || 'Unknown',
+    ruleType: 'array',
+    metadata: { itemSize, minItems, maxItems },
+    hints: [
+      `📊 ARRAY PROPERTY: ${propInfo?.shortName} contains an array of ${itemSize}-byte items.`,
+      `Expected range: ${minItems === 0 ? 'zero or more' : minItems + (maxItems !== '*' ? ' to ' + maxItems : '')} items.`,
+    ],
+  };
+}
+
+/** Get all complex rules for a specific EOJ type */
+export function getAllComplexRules(eojKey: string, mraDir?: string): ComplexPropertyRule[] {
+  const cache = loadMraData(mraDir);
+  const lookup = cache.get(eojKey);
+  
+  if (!lookup) return [];
+  
+  const rules: ComplexPropertyRule[] = [];
+  
+  // Scan all properties for coefficient relationships
+  for (const [epc] of lookup.properties.entries()) {
+    const coeffRule = getCoefficientRule(epc, eojKey, mraDir);
+    if (coeffRule) {
+      rules.push({
+        epc,
+        shortName: coeffRule.sourceShortName,
+        propertyName: coeffRule.sourcePropertyName,
+        ruleType: 'coefficient',
+        metadata: coeffRule,
+        hints: [coeffRule.instruction],
+      });
+    }
+    
+    const atomicRule = getAtomicRule(epc, eojKey, mraDir);
+    if (atomicRule) {
+      rules.push(atomicRule);
+    }
+    
+    const arrayRule = getArrayRule(epc, eojKey, mraDir);
+    if (arrayRule) {
+      rules.push(arrayRule);
+    }
+  }
+  
+  return rules;
+}
+
+/** Get all coefficient rules for a specific EOJ type as ComplexPropertyRule[] */
+export function getAllCoefficientRulesAsComplex(eojKey: string, mraDir?: string): ComplexPropertyRule[] {
+  const cache = loadMraData(mraDir);
+  const lookup = cache.get(eojKey);
+  
+  if (!lookup) return [];
+  
+  const rules: ComplexPropertyRule[] = [];
+  
+  for (const [epc] of lookup.properties.entries()) {
+    const coeffRule = getCoefficientRule(epc, eojKey, mraDir);
+    if (coeffRule) {
+      rules.push({
+        epc,
+        shortName: coeffRule.sourceShortName,
+        propertyName: coeffRule.sourcePropertyName,
+        ruleType: 'coefficient',
+        metadata: coeffRule,
+        hints: [coeffRule.instruction],
+      });
+    }
+  }
+  
+  return rules;
 }
 
 /**
@@ -669,4 +1167,176 @@ export function decodePropertyState(epc: number, pv: Uint8Array, mraDir?: string
   }
 
   return null; // No special decoding - return raw value
+}
+
+// ============================================================================
+// Element-Level Parsing for Complex Object/Array-Type EPCs
+// ============================================================================
+
+/**
+ * Get the byte size of a type definition from MRA definitions.
+ * Handles format, levels, and other type specifications.
+ */
+function getTypeByteSize(typeDef: any): number {
+  if (!typeDef) return 1;
+  
+  // Direct format specification (uint8, uint16, int16, uint32, etc.)
+  if (typeDef.format) {
+    const fmt = typeDef.format.toLowerCase();
+    if (fmt.includes('int8') || fmt.includes('uint8')) return 1;
+    if (fmt.includes('int16') || fmt.includes('uint16')) return 2;
+    if (fmt.includes('int32') || fmt.includes('uint32')) return 4;
+    if (fmt.includes('int64') || fmt.includes('uint64')) return 8;
+  }
+  
+  // Level-based types: byteSize = ceil(levelCount / 256) to fit max value
+  if (typeDef.levelCount !== undefined) {
+    // e.g., level_31-8 has 8 levels, needs 1 byte (0x31-0x38)
+    return 1;
+  }
+  
+  // Default: 1 byte
+  return 1;
+}
+
+/**
+ * Parse an object-type EPC value into named elements based on MRA definition.
+ * 
+ * For example, EPC 0xE2 (Historical data) has this structure:
+ * - Element 1 "day": uint16 (2 bytes) - the date context
+ * - Element 2 "electricEnergy": array of 48 items × 4 bytes each = 192 bytes
+ * 
+ * This function splits the raw hex into named elements with their byte ranges.
+ */
+export function parseEpcElements(
+  pv: Uint8Array,
+  propertyData: any
+): {
+  elements: Array<{
+    name: string;
+    label?: string;
+    rawHex: string;
+    rawBytes: string[];
+    isObject: boolean;
+    itemSize?: number;
+    minItems?: number;
+    maxItems?: number;
+    items?: Array<{ index: number; rawHex: string; rawBytes: string[] }>;
+  }>;
+} {
+  const elements: typeof parseEpcElements.prototype.return.elements = [];
+  
+  if (!propertyData || propertyData.type !== 'object' || !propertyData.properties) {
+    return { elements };
+  }
+  
+  let offset = 0;
+  
+  for (const propDef of propertyData.properties) {
+    const elementName = propDef.shortName || '';
+    const label = propDef.elementName?.en || propDef.elementName?.ja || elementName;
+    
+    if (!elementName) continue;
+    
+    const rawBytes: string[] = [];
+    let isObjectArray = false;
+    let itemSize: number | undefined;
+    let minItems: number | undefined;
+    let maxItems: number | undefined;
+    const arrayItems: Array<{ index: number; rawHex: string; rawBytes: string[] }> = [];
+    
+    if (propDef.element?.type === 'array') {
+      // Array type - extract all items
+      isObjectArray = true;
+      itemSize = propDef.element.itemSize || 1;
+      minItems = propDef.element.minItems;
+      maxItems = propDef.element.maxItems;
+      
+      const remainingBytes = pv.length - offset;
+      const effectiveItemSize = itemSize!;
+      const itemCount = Math.floor(remainingBytes / effectiveItemSize);
+      
+      for (let i = 0; i < itemCount; i++) {
+        const start = offset + i * effectiveItemSize;
+        const end = Math.min(start + effectiveItemSize, pv.length);
+        const itemBytes: number[] = [];
+        
+        for (let j = start; j < end; j++) {
+          itemBytes.push(pv[j]);
+        }
+        
+        const hexStr = itemBytes.map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`).join(' ');
+        arrayItems.push({ index: i, rawHex: hexStr, rawBytes: itemBytes.map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`) });
+      }
+      
+      // Consume all remaining bytes for the array
+      while (offset < pv.length) {
+        rawBytes.push(`0x${pv[offset].toString(16).toUpperCase().padStart(2, '0')}`);
+        offset++;
+      }
+    } else {
+      // Scalar type - get byte size from definition
+      const byteSize = getTypeByteSize(propDef.element) || 1;
+      
+      for (let i = 0; i < byteSize && offset + i < pv.length; i++) {
+        rawBytes.push(`0x${pv[offset + i].toString(16).toUpperCase().padStart(2, '0')}`);
+      }
+      
+      offset += Math.min(byteSize, pv.length - offset);
+    }
+    
+    const hexStr = rawBytes.join(' ');
+    
+    elements.push({
+      name: elementName,
+      label: label || undefined,
+      rawHex: hexStr,
+      rawBytes,
+      isObject: isObjectArray,
+      itemSize,
+      minItems,
+      maxItems,
+      items: arrayItems.length > 0 ? arrayItems : undefined,
+    });
+  }
+  
+  return { elements };
+}
+
+/**
+ * Main exported function: Parse an object/array-type EPC value into named elements.
+ * Returns a structured result suitable for LLM consumption.
+ */
+export function parseEpcElementsResult(
+  epc: number,
+  pv: Uint8Array,
+  propertyData: any,
+  propertyName?: string,
+  shortName?: string
+): {
+  epc: string;
+  propertyName: string;
+  shortName: string;
+  rawHex: string[];
+  elements: Array<{
+    name: string;
+    label?: string;
+    rawHex: string;
+    rawBytes: string[];
+    isObject: boolean;
+    itemSize?: number;
+    minItems?: number;
+    maxItems?: number;
+    items?: Array<{ index: number; rawHex: string; rawBytes: string[] }>;
+  }>;
+} {
+  const rawHex = Array.from(pv).map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`);
+  
+  return {
+    epc: `0x${epc.toString(16).toUpperCase()}`,
+    propertyName: propertyName || '',
+    shortName: shortName || '',
+    rawHex,
+    ...parseEpcElements(pv, propertyData),
+  };
 }

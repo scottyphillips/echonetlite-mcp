@@ -709,7 +709,7 @@ export class EchonetLiteClient {
         { epc: EPC_MANUFACTURER, pv: new Uint8Array([]), ac: 4 },   // 0xFE - Manufacturer
         { epc: EPC_ECOI, pv: new Uint8Array([]), ac: 4 },           // 0xFD - Product Code/ECOI
         { epc: EPC_UID, pv: new Uint8Array([]), ac: 4 },            // 0xFC - Unique ID
-        { epc: EPC_INSTANCE_LIST, pv: new Uint8Array([0x01]), ac: 4 }, // 0xE0 - Instance List (with GET parameter)
+        { epc: EPC_INSTANCE_LIST, pv: new Uint8Array([]), ac: 4 }, // 0xD6 - Instance List (empty PV per pychonet spec)
       ],
     };
 

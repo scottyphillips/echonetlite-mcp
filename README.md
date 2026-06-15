@@ -67,6 +67,35 @@ ECHONET_DEFAULT_HOST=192.168.1.10 node dist/index.js
 export const DEFAULT_HOST = '192.168.1.10';  // Change to your device IP
 ```
 
+### Lite Mode (Restricted Tool Set)
+
+Enable **Lite Mode** to restrict exposed tools to a minimal subset. In lite mode, only these 6 tools are available:
+
+| Tool | Description |
+|------|-------------|
+| `discover_devices` | Discover all ECHONETLite devices on the local network |
+| `discover_nodes` | Active Node Profile probing of a specific device |
+| `set_epc` | Generic EPC setter for any EOJ instance |
+| `get_property_maps` | Query STATMAP/SETMAP/GETMAP with MRA names |
+| `query_epc` | Query EPC codes from device with decoded values |
+| `get_epc_definition` | Get MRA definition for EPC codes without querying |
+
+All HVAC-specific tools (`get_device_status`, `set_operation`, `set_temperature`, etc.) are hidden in lite mode.
+
+**Enable Lite Mode:**
+```bash
+# Windows CMD
+set ECHONET_LITE_MODE=true && node dist/index.js
+
+# PowerShell
+$env:ECHONET_LITE_MODE="true"; node dist/index.js
+
+# Linux/macOS
+ECHONET_LITE_MODE=true node dist/index.js
+```
+
+When lite mode is enabled, the server logs `(Mode: LITE)` on startup. When disabled (default), it logs `(Mode: FULL)` with all tools available.
+
 ### Per-Tool Override
 
 Every tool accepts an optional `host` parameter to override the default for that specific call:
@@ -148,6 +177,8 @@ Configure in your VS Code MCP extension settings:
 
 ## Available Tools
 
+> **Note:** When `ECHONET_LITE_MODE=true`, only `discover_devices`, `discover_nodes`, `set_epc`, `get_property_maps`, `query_epc`, and `get_epc_definition` are available.
+
 ### Device Discovery
 
 | Tool | Description | Parameters |
@@ -155,7 +186,7 @@ Configure in your VS Code MCP extension settings:
 | `discover_devices` | Discover all ECHONETLite devices on the local network via multicast | `timeout` (optional) - Discovery timeout in ms (default: 3000) |
 | `discover_nodes` | Active Node Profile probing of a specific device — discovers manufacturer, product code, UID, and all EOJ instances with MRA enrichment | `host` (required), `timeout` (optional) |
 
-### HVAC Control
+### HVAC Control (Full Mode Only)
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
@@ -171,14 +202,14 @@ Configure in your VS Code MCP extension settings:
 | `set_silent_mode` | Set silent operation mode | `host`, `mode` ("normal" / "high-speed" / "silent") |
 | `set_power_saving` | Set power-saving mode | `host`, `state` ("saving" / "normal") |
 
-### Sensor Readings
+### Sensor Readings (Full Mode Only)
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | `get_temperatures` | Get room + outdoor temperatures | `host` (optional) - IP address |
 | `get_humidity` | Get room humidity | `host` (optional) - IP address |
 
-### EPC Introspection & MRA Lookup
+### EPC Introspection & MRA Lookup (Available in All Modes)
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
@@ -187,7 +218,7 @@ Configure in your VS Code MCP extension settings:
 | `get_epc_definition` | Get MRA definition for EPC codes without querying the device — includes enum values, bitmaps, level ranges, $ref-resolved definitions | `epcs` (required), `host`, `eojgc`, `eojcc`, `eojInstance` (all optional) |
 | `set_epc` | Generic EPC setter — set any writable property on any EOJ instance by hex value | `host`, `eojgc`, `eojcc`, `eojInstance`, `epc`, `value` |
 
-### Device Configuration
+### Device Configuration (Full Mode Only)
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
@@ -234,7 +265,7 @@ Configure in your VS Code MCP extension settings:
 
 Try these natural language prompts with your MCP client:
 
-- `"Turn on my air conditioner"` → calls `set_operation` with `operation="on"`
+- `"Turn on my air conditioner"` → calls `set_operation` with `operation="on"` (Full Mode)
 - `"Set temperature to 23 degrees"` → calls `set_temperature` with `temperature=23`
 - `"Switch to cooling mode"` → calls `set_operating_mode` with `mode="cool"`
 - `"What are the current temperatures?"` → calls `get_temperatures`
@@ -250,38 +281,7 @@ Try these natural language prompts with your MCP client:
 ```
 echonetlite-mcp/
 ├── src/
-│   ├── index.ts              # MCP server entry point & tool definitions (~1150 lines)
-│   ├── echonetlite.ts        # ECHONETLite client wrapper (UDP communication)
-│   ├── mra.ts                # MRA (Machine Readable Index) data loader & decoders
-│   ├── devices/
-│   │   └── homeAirConditioner.ts  # HVAC device handler (status, controls, notifications)
-│   ├── types.ts              # TypeScript type definitions
-│   └── config.ts             # Configuration constants
-├── mra/
-│   ├── mraData/              # MRA JSON definition files
-│   ├── COPYRIGHT.txt         # MRA copyright information
-│   └── ReleaseNote_en.md     # MRA release notes
-├── package.json
-├── tsconfig.json
-├── LICENSE
-└── README.md
-```
-
-## Development
-
-```bash
-# Clone and install dependencies
-git clone https://github.com/scottyphillips/echonetlite-mcp.git
-cd echonetlite-mcp
-npm install
-
-# Build TypeScript
-npm run build
-
-# Watch mode for development
-npm run dev
-
-# Run the server
+│   ├── index.ts              # MCP server entry point & tool definitions (~1200 lines)
 node dist/index.js
 ```
 

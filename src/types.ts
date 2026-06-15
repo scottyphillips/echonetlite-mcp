@@ -424,3 +424,50 @@ export interface SetPowerSavingParams {
   host?: string;
   state: HvacPowerSaving;
 }
+
+// ============================================================================
+// Element-Level Parsing Types (for complex object-type EPCs)
+// ============================================================================
+
+/** A single parsed element from an object/array-type property value */
+export interface ParsedElement {
+  /** Element name/shortName from MRA definition (e.g., "day", "electricEnergy") */
+  name: string;
+  /** Human-readable label for the element */
+  label?: string;
+  /** Raw bytes of this element as hex strings */
+  rawHex: string;
+  /** Individual byte values as hex strings */
+  rawBytes: string[];
+}
+
+/** A single item from a parsed array-type element */
+export interface ParsedArrayItem {
+  /** Index in the array (0-based) */
+  index: number;
+  /** Time slot label for fixed-structure arrays like E2 (e.g., "00:00", "00:30") */
+  timeSlot?: string;
+  /** Raw bytes of this item as hex strings */
+  rawHex: string;
+  /** Individual byte values as hex strings */
+  rawBytes: string[];
+}
+
+/** Result of parsing an object/array-type EPC value into named elements */
+export interface ParsedEpcElements {
+  /** The EPC code in hex format */
+  epc: string;
+  /** Property name from MRA */
+  propertyName: string;
+  /** Short name from MRA */
+  shortName: string;
+  /** Total raw value as hex strings (before element splitting) */
+  rawHex: string[];
+  /** Named elements parsed from the object structure */
+  elements: ParsedElement[];
+  /** For array-type elements, their individual items */
+  arrayItems?: Array<{
+    elementName: string;
+    items: ParsedArrayItem[];
+  }>;
+}

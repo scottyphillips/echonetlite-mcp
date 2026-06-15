@@ -7,6 +7,20 @@
 export const DEFAULT_HOST = process.env.ECHONET_DEFAULT_HOST || '192.168.1.6';
 
 /**
+ * Enable "Lite Mode" - restricts exposed tools to a minimal subset.
+ * When enabled, only the following tools are available:
+ *   - discover_devices
+ *   - discover_nodes
+ *   - set_epc
+ *   - get_property_maps
+ *   - query_epc
+ *   - get_epc_definition
+ * 
+ * Override via environment variable: ECHONET_LITE_MODE=true
+ */
+export const LITE_MODE = process.env.ECHONET_LITE_MODE === 'true';
+
+/**
  * UDP port for ECHONETLite communication
  */
 export const ECHONET_PORT = 3610;
