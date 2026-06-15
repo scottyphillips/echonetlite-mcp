@@ -1,14 +1,69 @@
 /**
  * MRA (Mandatory Requirements for All) Property Lookup
- * Loads ECHONETLite MRA JSON files to provide readable property names and descriptions
+ * Uses bundled MRA data loaded at build time via __dirname-relative path.
+ * This eliminates runtime file reads that break when process.cwd() != project root.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Use createRequire to get require() in ES module context
+const require = createRequire(import.meta.url);
+
+// ============================================================================
+// Bundled MRA Data - loaded once at module initialization via __dirname-relative path
+// ============================================================================
+
+let bundledData: { version: string; files: Record<string, any> } | null = null;
+
+function loadBundledMraData(): { version: string; files: Record<string, any> } | null {
+  if (bundledData) return bundledData;
+  
+  try {
+    // Load from bundled JSON file using __dirname-relative path (always works regardless of cwd)
+    const bundledPath = path.join(__dirname, 'mra-bundled.json');
+    bundledData = require(bundledPath);
+  } catch (e: any) {
+    console.error(`Error loading bundled MRA data: ${e.message}`);
+    bundledData = { version: '1.0', files: {} };
+  }
+  
+  return bundledData;
+}
+
+// Helper to get a file from the bundled data by EOJ key and path pattern
+function getBundledFile(eojKey: string, subDir: string): any {
+  const bundled = loadBundledMraData();
+  if (!bundled) return null;
+  // Try exact match first (e.g., "mraData/devices/0x0288.json")
+  const exactPath = `mraData/${subDir}/${eojKey}.json`;
+  if (bundled.files[exactPath]) return bundled.files[exactPath];
+  
+  // Try with leading zero variations
+  for (const key of Object.keys(bundled.files)) {
+    if (key.endsWith(`/${subDir}/${eojKey}.json`)) return bundled.files[key];
+  }
+  
+  return null;
+}
+
+function getBundledFileByPath(relativePath: string): any {
+  const bundled = loadBundledMraData();
+  if (!bundled) return null;
+  // Normalize path separators
+  const normalizedPath = relativePath.replace(/\\/g, '/');
+  if (bundled.files[normalizedPath]) return bundled.files[normalizedPath];
+  
+  // Try with forward slashes
+  const fsPath = `mraData/${normalizedPath}`;
+  if (bundled.files[fsPath]) return bundled.files[fsPath];
+  
+  return null;
+}
 
 interface MraProperty {
   epc: number;
@@ -69,7 +124,7 @@ export interface ComplexPropertyRule {
   hints: string[];
 }
 
-// Cache for superclass properties (loaded once from 0x0000.json, shared by all devices)
+// Cache for superclass properties (loaded once from bundled data)
 let superClassPropsCache: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> | null = null;
 
 let propertyCache: Map<string, PropertyLookup> | null = null;
@@ -80,16 +135,20 @@ export function buildEojKey(gc: number, cc: number, inst?: number): string {
   return `0x${gc.toString(16).padStart(2, '0').toUpperCase()}${cc.toString(16).padStart(2, '0').toUpperCase()}`;
 }
 
-/** Load superclass properties from the main superclass file (0x0000.json) */
-function loadSuperClassProperties(superClassDir: string): Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> | null {
-  const superClassFile = path.join(superClassDir, '0x0000.json');
-  if (!fs.existsSync(superClassFile)) return null;
+/** Load superclass properties from bundled data */
+function loadSuperClassProperties(): Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> | null {
+  if (superClassPropsCache) return superClassPropsCache;
   
-  try {
-    const content = JSON.parse(fs.readFileSync(superClassFile, 'utf-8'));
-    if (content.elProperties && Array.isArray(content.elProperties)) {
-      const props: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> = new Map();
-      for (const p of content.elProperties) {
+  // Try the main superclass file first (0x0000.json)
+  const superClassFile = getBundledFile('0x0000', 'superClass');
+  if (!superClassFile) {
+    // Also try by path pattern
+    const data = getBundledFileByPath('superClass/0x0000.json');
+    if (!data) return null;
+    
+    superClassPropsCache = new Map();
+    if (data.elProperties && Array.isArray(data.elProperties)) {
+      for (const p of data.elProperties) {
         if (p.epc != null && p.shortName) {
           const propInfo = {
             name: p.propertyName?.en || p.propertyName?.ja || '',
@@ -97,91 +156,102 @@ function loadSuperClassProperties(superClassDir: string): Map<number, { name: st
             accessRule: p.accessRule || {},
             description: p.descriptions?.en || p.descriptions?.ja || ''
           };
-          props.set(parseInt(p.epc, 16), propInfo);
+          superClassPropsCache.set(parseInt(p.epc, 16), propInfo);
         }
       }
-      return props;
     }
-  } catch {
-    // Skip invalid files
+    return superClassPropsCache;
   }
-  return null;
+  
+  superClassPropsCache = new Map();
+  if (superClassFile.elProperties && Array.isArray(superClassFile.elProperties)) {
+    for (const p of superClassFile.elProperties) {
+      if (p.epc != null && p.shortName) {
+        const propInfo = {
+          name: p.propertyName?.en || p.propertyName?.ja || '',
+          shortName: p.shortName,
+          accessRule: p.accessRule || {},
+          description: p.descriptions?.en || p.descriptions?.ja || ''
+        };
+        superClassPropsCache.set(parseInt(p.epc, 16), propInfo);
+      }
+    }
+  }
+  
+  return superClassPropsCache;
 }
 
-/** Load all MRA data from disk */
-export function loadMraData(mraDir?: string): Map<string, PropertyLookup> {
+/** Load all MRA data from bundled data */
+export function loadMraData(mraDir?: string): Map<string, PropertyLookup> | null {
   if (propertyCache) return propertyCache;
   
-  const dir = mraDir || path.join(__dirname, '..', 'mra', 'mraData');
   const result = new Map<string, PropertyLookup>();
-
+  
   // Load superclass properties FIRST (common properties inherited by ALL devices)
-  const superClassDir = path.join(dir, 'superClass');
-  if (fs.existsSync(superClassDir)) {
-    superClassPropsCache = loadSuperClassProperties(superClassDir);
-  }
-
-  // Load device-specific classes
-  const devicesDir = path.join(dir, 'devices');
-  if (fs.existsSync(devicesDir)) {
-    const files = fs.readdirSync(devicesDir).filter(f => f.endsWith('.json'));
-    for (const file of files) {
-      try {
-        const content = JSON.parse(fs.readFileSync(path.join(devicesDir, file), 'utf-8'));
-        if (content.elProperties && Array.isArray(content.elProperties)) {
-          // Start with superclass properties as the base
-          const props: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> = new Map();
-          
-          // First add all superclass properties (shared by all devices)
-          if (superClassPropsCache) {
-            for (const [epc, info] of superClassPropsCache) {
-              props.set(epc, info);
-            }
+  superClassPropsCache = loadSuperClassProperties();
+  
+  // Get all device files from bundled data
+  const bundled = loadBundledMraData();
+  if (!bundled) return null;
+  
+  for (const [filePath, content] of Object.entries(bundled.files)) {
+    // Load both device files and node profile files
+    const isDeviceFile = filePath.startsWith('mraData/devices/');
+    const isNodeProfileFile = filePath.startsWith('mraData/nodeProfile/');
+    if (!isDeviceFile && !isNodeProfileFile) continue;
+    
+    try {
+      const fileContent = content as any;
+      if (fileContent.elProperties && Array.isArray(fileContent.elProperties) && fileContent.eoj) {
+        // Start with superclass properties as the base
+        const props: Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> = new Map();
+        
+        // First add all superclass properties (shared by all devices)
+        if (superClassPropsCache) {
+          for (const [epc, info] of superClassPropsCache) {
+            props.set(epc, info);
           }
-          
-          // Then overlay device-specific properties (may override superclass for same EPC)
-          for (const p of content.elProperties) {
-            if (p.epc != null && p.shortName) {
-              const propInfo = {
-                name: p.propertyName?.en || p.propertyName?.ja || '',
-                shortName: p.shortName,
-                accessRule: p.accessRule || {},
-                description: p.descriptions?.en || p.descriptions?.ja || ''
-              };
-              props.set(parseInt(p.epc, 16), propInfo);
-            }
-          }
-          
-          result.set(content.eoj, {
-            eoJName: content.className?.en || content.className?.ja || content.eoj,
-            shortName: content.shortName,
-            properties: props
-          });
         }
-      } catch (e) {
-        // Skip invalid files
+        
+        // Then overlay device-specific properties (may override superclass for same EPC)
+        for (const p of fileContent.elProperties) {
+          if (p.epc != null && p.shortName) {
+            const propInfo = {
+              name: p.propertyName?.en || p.propertyName?.ja || '',
+              shortName: p.shortName,
+              accessRule: p.accessRule || {},
+              description: p.descriptions?.en || p.descriptions?.ja || ''
+            };
+            props.set(parseInt(p.epc, 16), propInfo);
+          }
+        }
+        
+        // Node Profile files use "eoj" field for the EOJ key (0x0EF0)
+        const eojKey = isNodeProfileFile ? fileContent.eoj : fileContent.eoj;
+        result.set(eojKey, {
+          eoJName: fileContent.className?.en || fileContent.className?.ja || fileContent.eoj,
+          shortName: fileContent.shortName,
+          properties: props
+        });
       }
+    } catch (e) {
+      // Skip invalid files
     }
   }
-
+  
   propertyCache = result;
   return result;
 }
 
-/** Load definitions from definitions.json */
+/** Load definitions from bundled data */
 export function loadDefinitions(mraDir?: string): any {
   if (definitionsCache) return definitionsCache;
   
-  const dir = mraDir || path.join(__dirname, '..', 'mra', 'mraData');
-  const defsFile = path.join(dir, 'definitions', 'definitions.json');
+  const defsFile = getBundledFileByPath('definitions/definitions.json');
   
-  try {
-    if (fs.existsSync(defsFile)) {
-      definitionsCache = JSON.parse(fs.readFileSync(defsFile, 'utf-8'));
-    } else {
-      definitionsCache = { definitions: {} };
-    }
-  } catch {
+  if (defsFile) {
+    definitionsCache = defsFile;
+  } else {
     definitionsCache = { definitions: {} };
   }
   
@@ -195,9 +265,6 @@ export function resolveRef(ref: string, mraDir?: string): any {
   // Strip leading '#' from JSON pointers (e.g., "#/definitions/state_ON-OFF_3031" -> "/definitions/state_ON-OFF_3031")
   const normalizedRef = ref.startsWith('#') ? ref.slice(1) : ref;
   
-  // Handle both formats:
-  // - "#/definitions/state_ON-OFF_3031" or "/definitions/state_ON-OFF_3031" (JSON pointer)
-  // - "definitions/number_-12.7-12.5Celsius" (relative path without leading slash)
   let current: any;
   if (normalizedRef.startsWith('/')) {
     // JSON pointer format - navigate from the root definitions object
@@ -235,6 +302,7 @@ export function resolveRef(ref: string, mraDir?: string): any {
 /** Get property info for a specific EOJ and EPC */
 export function getPropertyInfo(eojKey: string, epc: number, mraDir?: string): { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string } | null {
   const cache = loadMraData(mraDir);
+  if (!cache) return null;
   const lookup = cache.get(eojKey);
   if (!lookup) return null;
   return lookup.properties.get(epc) || null;
@@ -243,6 +311,7 @@ export function getPropertyInfo(eojKey: string, epc: number, mraDir?: string): {
 /** Get all property info for a specific EOJ */
 export function getAllPropertyInfo(eojKey: string, mraDir?: string): Map<number, { name: string; shortName: string; accessRule: MraProperty['accessRule']; description?: string }> | null {
   const cache = loadMraData(mraDir);
+  if (!cache) return null;
   const lookup = cache.get(eojKey);
   return lookup ? lookup.properties : null;
 }
@@ -250,6 +319,7 @@ export function getAllPropertyInfo(eojKey: string, mraDir?: string): Map<number,
 /** Get EOJ class name */
 export function getEojName(eojKey: string, mraDir?: string): string {
   const cache = loadMraData(mraDir);
+  if (!cache) return eojKey;
   const lookup = cache.get(eojKey);
   return lookup ? lookup.eoJName : eojKey;
 }
@@ -294,282 +364,202 @@ function extractCoefficientEpcs(data: any, mraDir?: string): number[] {
 }
 
 /**
- * Get coefficient details for a specific EPC by looking up the referenced coefficient EPCs.
- * Returns detailed information about each coefficient including property names.
+ * Parse an object-type EPC value into named elements based on MRA definition.
+ * 
+ * Returns a clean structure where each element contains:
+ * - The data definition (type, itemSize, minItems, maxItems, etc.)
+ * - A proper-sized array of hex values (one per byte)
+ * 
+ * Example output for EPC 0xE2:
+ * {
+ *   "elements": [
+ *     {
+ *       "name": "day",
+ *       "definition": { "type": "number", "format": "uint16" },
+ *       "values": ["0x00", "0x00"]
+ *     },
+ *     {
+ *       "name": "electricEnergy",
+ *       "definition": { "type": "array", "itemSize": 4, "minItems": 48, "maxItems": 48 },
+ *       "values": ["0x00", "0x00", "0x00", "0x13", ...]  // 192 hex values for 48 items × 4 bytes
+ *     }
+ *   ]
+ * }
  */
-function getCoefficientDetails(
-  sourceEpc: number, 
-  coefficientEpcs: number[], 
-  eojKey: string, 
+export function parseEpcElements(
+  pv: Uint8Array,
+  propertyData: any,
   mraDir?: string
-): { epc: number; shortName: string; propertyName: string }[] {
-  const cache = loadMraData(mraDir);
-  const lookup = cache.get(eojKey);
+): {
+  elements: Array<{
+    name: string;
+    label?: string;
+    definition: Record<string, any>;
+    values: any[];
+  }>;
+} {
+  const elements: Array<{
+    name: string;
+    label?: string;
+    definition: Record<string, any>;
+    values: any[];
+  }> = [];
   
-  if (!lookup) return [];
-  
-  return coefficientEpcs.map((coeffEpc) => {
-    const propInfo = lookup.properties.get(coeffEpc);
-    return {
-      epc: coeffEpc,
-      shortName: propInfo?.shortName || `epc_0x${coeffEpc.toString(16).toUpperCase()}`,
-      propertyName: propInfo?.name || `Unknown (0x${coeffEpc.toString(16).toUpperCase()})`,
-    };
-  });
-}
-
-/**
- * Generate a human-readable instruction for LLMs about how to apply coefficients.
- */
-function generateCoefficientInstruction(
-  sourceShortName: string,
-  coefficientDetails: { epc: number; shortName: string; propertyName: string }[],
-  note?: string
-): string {
-  const coeffNames = coefficientDetails.map(c => 
-    `${c.shortName} (EPC 0x${c.epc.toString(16).toUpperCase()})`
-  ).join(' × ');
-  
-  let instruction = `⚠️ COEFFICIENT RULE: The raw value for "${sourceShortName}" must be multiplied by:`;
-  instruction += `\n   ${coeffNames}`;
-  
-  if (note) {
-    instruction += `\n   Note: ${note}`;
+  if (!propertyData || propertyData.type !== 'object' || !propertyData.properties) {
+    return { elements };
   }
   
-  return instruction;
-}
-
-/**
- * Get coefficient rules for a specific EPC on a device.
- * Returns null if no coefficient relationship exists.
- */
-export function getCoefficientRule(
-  epc: number, 
-  eojKey: string, 
-  mraDir?: string
-): CoefficientRule | null {
-  const rawData = getRawMraPropertyData(epc, eojKey, mraDir);
+  let offset = 0;
   
-  if (!rawData) return null;
-  
-  // Extract coefficient EPCs from the data structure
-  const coefficientEpcs = extractCoefficientEpcs(rawData, mraDir);
-  
-  if (coefficientEpcs.length === 0) return null;
-  
-  // Load MRA data for property info
-  const cache = loadMraData(mraDir);
-  const lookup = cache.get(eojKey);
-  
-  if (!lookup) return null;
-  
-  const propInfo = lookup.properties.get(epc);
-  const sourceShortName = propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`;
-  const sourcePropertyName = propInfo?.name || `Unknown (EPC 0x${epc.toString(16).toUpperCase()})`;
-  
-  // Get coefficient details
-  const coefficientDetails = getCoefficientDetails(epc, coefficientEpcs, eojKey, mraDir);
-  
-  // Extract note from rawData or oneOf options
-  let note: string | undefined;
-  if (rawData?.note) {
-    note = rawData.note;
-  } else if (rawData?.oneOf && Array.isArray(rawData.oneOf)) {
-    for (const option of rawData.oneOf) {
-      if (option?.note) {
-        note = option.note;
-        break;
-      }
-    }
-  }
-  
-  // Generate human-readable instruction
-  const instruction = generateCoefficientInstruction(sourceShortName, coefficientDetails, note);
-  
-  return {
-    sourceEpc: epc,
-    sourceShortName,
-    sourcePropertyName,
-    coefficientEpcs,
-    coefficientDetails,
-    instruction,
-    note,
-  };
-}
-
-/**
- * Get ALL coefficient rules for a specific EOJ type.
- * Scans all properties and returns those with coefficient relationships.
- */
-export function getAllCoefficientRules(
-  eojKey: string, 
-  mraDir?: string
-): CoefficientRule[] {
-  const cache = loadMraData(mraDir);
-  const lookup = cache.get(eojKey);
-  
-  if (!lookup) return [];
-  
-  const rules: CoefficientRule[] = [];
-  
-  // Scan all properties for coefficient relationships
-  for (const [epc, propInfo] of lookup.properties.entries()) {
-    const rule = getCoefficientRule(epc, eojKey, mraDir);
-    if (rule) {
-      rules.push(rule);
-    }
-  }
-  
-  return rules;
-}
-
-/**
- * Get complex property rules for a specific EPC on a device.
- * This includes coefficient rules, atomic operation hints, and other special patterns.
- */
-export function getComplexPropertyRule(
-  epc: number, 
-  eojKey: string, 
-  mraDir?: string
-): ComplexPropertyRule | null {
-  const rawData = getRawMraPropertyData(epc, eojKey, mraDir);
-  
-  if (!rawData) return null;
-  
-  const cache = loadMraData(mraDir);
-  const lookup = cache.get(eojKey);
-  
-  if (!lookup) return null;
-  
-  const propInfo = lookup.properties.get(epc);
-  const hints: string[] = [];
-  const metadata: Record<string, any> = {};
-  
-  // Check for coefficient rules
-  const coeffRule = getCoefficientRule(epc, eojKey, mraDir);
-  if (coeffRule) {
-    hints.push(coeffRule.instruction);
-    metadata.coefficient = coeffRule;
+  for (const propDef of propertyData.properties) {
+    const elementName = propDef.shortName || '';
+    const label = propDef.elementName?.en || propDef.elementName?.ja || elementName;
     
-    return {
-      epc,
-      shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
-      propertyName: propInfo?.name || 'Unknown',
-      ruleType: 'coefficient',
-      metadata,
-      hints,
-    };
-  }
-  
-  // Check for atomic operation relationships
-  if (rawData?.atomic) {
-    const atomicEpc = parseInt(rawData.atomic.replace('0x', ''), 16);
-    hints.push(`⚠️ ATOMIC OPERATION: EPC 0x${epc.toString(16).toUpperCase()} operates atomically with EPC 0x${atomicEpc.toString(16).toUpperCase()}. These properties must be read/written together.`);
-    metadata.atomic = { atomicEpc };
+    if (!elementName) continue;
     
-    return {
-      epc,
-      shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
-      propertyName: propInfo?.name || 'Unknown',
-      ruleType: 'atomic',
-      metadata,
-      hints,
-    };
-  }
-  
-  // Check for array properties with special structure
-  if (rawData?.type === 'array' && rawData?.itemSize) {
-    const itemSize = rawData.itemSize;
-    const minItems = rawData.minItems || 0;
-    const maxItems = rawData.maxItems || '*';
-    hints.push(`📊 ARRAY PROPERTY: This property contains ${maxItems === '*' ? 'up to' : minItems + ' to ' + maxItems} items of ${itemSize} bytes each.`);
-    metadata.array = { itemSize, minItems, maxItems };
+    const values: any[] = [];
     
-    return {
-      epc,
-      shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
-      propertyName: propInfo?.name || 'Unknown',
-      ruleType: 'array',
-      metadata,
-      hints,
-    };
-  }
-  
-  // Check for object properties with elements that have coefficients
-  if (rawData?.type === 'object' && rawData?.properties) {
-    const elementCoefficients: number[][] = [];
-    
-    function scanObjectElements(props: any): void {
-      if (!props || !Array.isArray(props)) return;
-      for (const prop of props) {
-        if (prop?.element) {
-          const coeffs = extractCoefficientEpcs(prop.element, mraDir);
-          if (coeffs.length > 0) {
-            elementCoefficients.push(coeffs);
-          }
+    if (propDef.element?.type === 'array') {
+      // Array type - extract each item as a separate array element
+      const itemSize = propDef.element.itemSize || 1;
+      const effectiveItemSize = itemSize;
+      const calculatedCount = Math.floor((pv.length - offset) / effectiveItemSize);
+      const itemCount = calculatedCount;
+      
+      for (let i = 0; i < itemCount; i++) {
+        const itemStart = offset + i * effectiveItemSize;
+        const itemBytes: string[] = [];
+        
+        for (let j = 0; j < effectiveItemSize && itemStart + j < pv.length; j++) {
+          itemBytes.push(`0x${pv[itemStart + j].toString(16).toUpperCase().padStart(2, '0')}`);
         }
-        // Recurse into nested structures
-        if (prop?.element?.oneOf && Array.isArray(prop.element.oneOf)) {
-          for (const opt of prop.element.oneOf) {
-            const coeffs = extractCoefficientEpcs(opt, mraDir);
-            if (coeffs.length > 0) {
-              elementCoefficients.push(coeffs);
+        
+        values.push(itemBytes);
+      }
+      
+      offset += itemCount * effectiveItemSize;
+      
+      // Build enriched item definition from MRA data
+      const itemsDef = propDef.element.items;
+      let itemDefinition: any = null;
+      
+      if (itemsDef) {
+        // Resolve $ref values in the items definition
+        function resolveRefs(obj: any): any {
+          if (!obj || typeof obj !== 'object') return obj;
+          
+          if (Array.isArray(obj)) {
+            return obj.map(resolveRefs);
+          }
+          
+          if (Array.isArray(obj.oneOf)) {
+            const resolvedOneOf = obj.oneOf.map((option: any) => {
+              if (option?.$ref) {
+                const resolved = resolveRef(option.$ref, mraDir);
+                // Merge the original metadata (coefficient, overflowCode, etc.) with the resolved definition
+                return resolved ? { ...resolved, ...(option.coefficient && { coefficient: option.coefficient }), ...(option.overflowCode != null && { overflowCode: option.overflowCode }), ...(option.underflowCode != null && { underflowCode: option.underflowCode }) } : option;
+              }
+              return resolveRefs(option);
+            });
+            return { oneOf: resolvedOneOf };
+          }
+          
+          if (obj.$ref) {
+            const resolved = resolveRef(obj.$ref, mraDir);
+            return resolved ? { ...resolved, ...(obj.coefficient && { coefficient: obj.coefficient }), ...(obj.overflowCode != null && { overflowCode: obj.overflowCode }), ...(obj.underflowCode != null && { underflowCode: obj.underflowCode }) } : obj;
+          }
+          
+          // Recurse into remaining object properties
+          const result: any = {};
+          for (const [key, value] of Object.entries(obj)) {
+            if (key !== '$ref') {
+              result[key] = resolveRefs(value);
             }
           }
+          return result;
         }
-      }
-    }
-    
-    scanObjectElements(rawData.properties);
-    
-    if (elementCoefficients.length > 0) {
-      // Flatten unique coefficient EPCs
-      const allCoeffEpcs = new Set<number>();
-      for (const coeffs of elementCoefficients) {
-        for (const c of coeffs) allCoeffEpcs.add(c);
+        
+        itemDefinition = resolveRefs(itemsDef);
       }
       
-      const coeffDetails = getCoefficientDetails(epc, Array.from(allCoeffEpcs), eojKey, mraDir);
-      const instruction = generateCoefficientInstruction(
-        propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
-        coeffDetails,
-        rawData.note
-      );
+      elements.push({
+        name: elementName,
+        label: label || undefined,
+        definition: {
+          type: 'array',
+          itemSize,
+          minItems: propDef.element.minItems,
+          maxItems: propDef.element.maxItems,
+          itemCount,
+          items: itemDefinition,
+        },
+        values,
+      });
+    } else {
+      // Scalar type - get byte size from definition (pass mraDir for $ref resolution)
+      const byteSize = getTypeByteSize(propDef.element, mraDir) || 1;
       
-      hints.push(instruction);
-      metadata.coefficient = {
-        sourceEpc: epc,
-        coefficientEpcs: Array.from(allCoeffEpcs),
-        coefficientDetails: coeffDetails,
-      };
+      for (let i = 0; i < byteSize && offset + i < pv.length; i++) {
+        values.push(`0x${pv[offset + i].toString(16).toUpperCase().padStart(2, '0')}`);
+      }
       
-      return {
-        epc,
-        shortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
-        propertyName: propInfo?.name || 'Unknown',
-        ruleType: 'coefficient',
-        metadata,
-        hints,
-      };
+      offset += Math.min(byteSize, pv.length - offset);
+      
+      elements.push({
+        name: elementName,
+        label: label || undefined,
+        definition: propDef.element || {},
+        values,
+      });
     }
   }
   
-  return null;
+  return { elements };
+}
+
+/**
+ * Main exported function: Parse an object/array-type EPC value into named elements.
+ * Returns a clean structure with data definitions and proper-sized arrays of hex values.
+ */
+export function parseEpcElementsResult(
+  epc: number,
+  pv: Uint8Array,
+  propertyData: any,
+  propertyName?: string,
+  shortName?: string,
+  mraDir?: string
+): {
+  epc: string;
+  propertyName: string;
+  shortName: string;
+  totalBytes: number;
+  elements: Array<{
+    name: string;
+    label?: string;
+    definition: Record<string, any>;
+    values: any[];
+  }>;
+} {
+  const result = parseEpcElements(pv, propertyData, mraDir);
+  
+  return {
+    epc: `0x${epc.toString(16).toUpperCase()}`,
+    propertyName: propertyName || '',
+    shortName: shortName || '',
+    totalBytes: pv.length,
+    elements: result.elements,
+  };
 }
 
 /** Get raw MRA property data for a specific EPC from the device JSON (or superclass if not found in device-specific file) */
 export function getRawMraPropertyData(epc: number, eojKey: string, mraDir?: string): any {
-  const dir = mraDir || path.join(__dirname, '..', 'mra', 'mraData');
-  
   // First try the device-specific file
-  const deviceFile = path.join(dir, 'devices', `${eojKey}.json`);
-  if (fs.existsSync(deviceFile)) {
+  const deviceFile = getBundledFile(eojKey, 'devices');
+  if (deviceFile) {
     try {
-      const content = JSON.parse(fs.readFileSync(deviceFile, 'utf-8'));
-      if (content.elProperties && Array.isArray(content.elProperties)) {
+      if (deviceFile.elProperties && Array.isArray(deviceFile.elProperties)) {
         const epcHex = `0x${epc.toString(16).toUpperCase()}`;
-        const prop = content.elProperties.find((p: any) => p.epc === epcHex);
+        const prop = deviceFile.elProperties.find((p: any) => p.epc === epcHex);
         if (prop?.data !== undefined) {
           return prop.data;
         }
@@ -580,26 +570,140 @@ export function getRawMraPropertyData(epc: number, eojKey: string, mraDir?: stri
   }
   
   // If not found in device file, check superclass files for inherited properties
-  const superClassDir = path.join(dir, 'superClass');
-  if (fs.existsSync(superClassDir)) {
-    const files = fs.readdirSync(superClassDir).filter(f => f.endsWith('.json'));
-    for (const file of files) {
-      try {
-        const content = JSON.parse(fs.readFileSync(path.join(superClassDir, file), 'utf-8'));
-        if (content.elProperties && Array.isArray(content.elProperties)) {
-          const epcHex = `0x${epc.toString(16).toUpperCase()}`;
-          const prop = content.elProperties.find((p: any) => p.epc === epcHex);
-          if (prop?.data !== undefined) {
-            return prop.data;
-          }
+  const superClassData = getBundledFileByPath('superClass/0x0000.json');
+  if (superClassData && superClassData.elProperties && Array.isArray(superClassData.elProperties)) {
+    const epcHex = `0x${epc.toString(16).toUpperCase()}`;
+    const prop = superClassData.elProperties.find((p: any) => p.epc === epcHex);
+    if (prop?.data !== undefined) {
+      return prop.data;
+    }
+  }
+  
+  // Also check other superclass files
+  const bundled = loadBundledMraData();
+  if (!bundled) return null;
+  
+  for (const [filePath, content] of Object.entries(bundled.files)) {
+    if (!filePath.startsWith('mraData/superClass/')) continue;
+    
+    try {
+      const fileContent = content as any;
+      if (fileContent.elProperties && Array.isArray(fileContent.elProperties)) {
+        const epcHex = `0x${epc.toString(16).toUpperCase()}`;
+        const prop = fileContent.elProperties.find((p: any) => p.epc === epcHex);
+        if (prop?.data !== undefined) {
+          return prop.data;
         }
-      } catch {
-        // Skip invalid files
       }
+    } catch {
+      // Skip invalid files
     }
   }
   
   return null;
+}
+
+// ============================================================================
+// Coefficient Rule Functions
+// ============================================================================
+
+/**
+ * Get coefficient rule for a specific EPC from the device definition.
+ * Returns coefficient information if this property requires multiplication by other EPC values.
+ */
+export function getCoefficientRule(epc: number, eojKey: string, mraDir?: string): CoefficientRule | null {
+  const rawData = getRawMraPropertyData(epc, eojKey, mraDir);
+  
+  if (!rawData?.coefficient) return null;
+  
+  // Extract coefficient EPCs from the data definition
+  const coeffEpcs = extractCoefficientEpcs(rawData, mraDir);
+  
+  if (coeffEpcs.length === 0) return null;
+  
+  // Get property info for context
+  const cache = loadMraData(mraDir);
+  if (!cache) return null;
+  const lookup = cache.get(eojKey);
+  if (!lookup) return null;
+  
+  const propInfo = lookup.properties.get(epc);
+  
+  // Get coefficient details
+  const coeffDetails: CoefficientRule['coefficientDetails'] = coeffEpcs.map(coeffEpc => {
+    const coeffPropInfo = lookup.properties.get(coeffEpc);
+    return {
+      epc: coeffEpc,
+      shortName: coeffPropInfo?.shortName || `epc_0x${coeffEpc.toString(16).toUpperCase()}`,
+      propertyName: coeffPropInfo?.name || 'Unknown',
+    };
+  });
+  
+  // Generate human-readable instruction for LLMs
+  const coeffNames = coeffDetails.map(d => `${d.shortName} (EPC 0x${d.epc.toString(16).toUpperCase()})`).join(' × ');
+  const instruction = `⚠️ COEFFICIENT RULE: The raw value for "${propInfo?.shortName || propInfo?.name}" must be multiplied by:\n   ${coeffNames}`;
+  
+  return {
+    sourceEpc: epc,
+    sourceShortName: propInfo?.shortName || `epc_0x${epc.toString(16).toUpperCase()}`,
+    sourcePropertyName: propInfo?.name || 'Unknown',
+    coefficientEpcs: coeffEpcs,
+    coefficientDetails: coeffDetails,
+    instruction,
+    note: rawData.note,
+  };
+}
+
+/** Get all coefficient rules for a specific EOJ type */
+export function getAllCoefficientRules(eojKey: string, mraDir?: string): CoefficientRule[] {
+  const cache = loadMraData(mraDir);
+  if (!cache) return [];
+  const lookup = cache.get(eojKey);
+  
+  if (!lookup) return [];
+  
+  const rules: CoefficientRule[] = [];
+  
+  for (const [epc] of lookup.properties.entries()) {
+    const rule = getCoefficientRule(epc, eojKey, mraDir);
+    if (rule) {
+      rules.push(rule);
+    }
+  }
+  
+  return rules;
+}
+
+/** Get coefficient details for a source EPC */
+function getCoefficientDetails(
+  sourceEpc: number,
+  coeffEpcs: number[],
+  eojKey: string,
+  mraDir?: string
+): CoefficientRule['coefficientDetails'] {
+  const cache = loadMraData(mraDir);
+  if (!cache) return [];
+  const lookup = cache.get(eojKey);
+  if (!lookup) return [];
+  
+  return coeffEpcs.map(coeffEpc => {
+    const propInfo = lookup.properties.get(coeffEpc);
+    return {
+      epc: coeffEpc,
+      shortName: propInfo?.shortName || `epc_0x${coeffEpc.toString(16).toUpperCase()}`,
+      propertyName: propInfo?.name || 'Unknown',
+    };
+  });
+}
+
+/** Generate coefficient instruction string */
+function generateCoefficientInstruction(
+  sourceShortName: string,
+  coeffDetails: CoefficientRule['coefficientDetails'],
+  note?: string
+): string {
+  const coeffNames = coeffDetails.map(d => `${d.shortName} (EPC 0x${d.epc.toString(16).toUpperCase()})`).join(' × ');
+  return `⚠️ COEFFICIENT RULE: The raw value for "${sourceShortName}" must be multiplied by:\n   ${coeffNames}${note ? `\n   Note: ${note}` : ''}`;
 }
 
 /**
@@ -633,6 +737,7 @@ export function decodeEpcValue(epc: number | string, pv: Uint8Array | number[], 
   
   // Load MRA data and get property info
   const cache = loadMraData(mraDir);
+  if (!cache) return null;
   const lookup = cache.get(eojKey);
   if (!lookup) return null;
   
@@ -681,6 +786,7 @@ function getAtomicRule(epc: number, eojKey: string, mraDir?: string): ComplexPro
   if (!rawData?.atomic) return null;
   
   const cache = loadMraData(mraDir);
+  if (!cache) return null;
   const lookup = cache.get(eojKey);
   if (!lookup) return null;
   
@@ -714,6 +820,7 @@ function getArrayRule(epc: number, eojKey: string, mraDir?: string): ComplexProp
   if (!rawData?.type || rawData.type !== 'array' || !rawData.itemSize) return null;
   
   const cache = loadMraData(mraDir);
+  if (!cache) return null;
   const lookup = cache.get(eojKey);
   if (!lookup) return null;
   
@@ -738,6 +845,7 @@ function getArrayRule(epc: number, eojKey: string, mraDir?: string): ComplexProp
 /** Get all complex rules for a specific EOJ type */
 export function getAllComplexRules(eojKey: string, mraDir?: string): ComplexPropertyRule[] {
   const cache = loadMraData(mraDir);
+  if (!cache) return [];
   const lookup = cache.get(eojKey);
   
   if (!lookup) return [];
@@ -775,6 +883,7 @@ export function getAllComplexRules(eojKey: string, mraDir?: string): ComplexProp
 /** Get all coefficient rules for a specific EOJ type as ComplexPropertyRule[] */
 export function getAllCoefficientRulesAsComplex(eojKey: string, mraDir?: string): ComplexPropertyRule[] {
   const cache = loadMraData(mraDir);
+  if (!cache) return [];
   const lookup = cache.get(eojKey);
   
   if (!lookup) return [];
@@ -1175,10 +1284,32 @@ export function decodePropertyState(epc: number, pv: Uint8Array, mraDir?: string
 
 /**
  * Get the byte size of a type definition from MRA definitions.
- * Handles format, levels, and other type specifications.
+ * Handles format, levels, oneOf types, $ref resolution, and other type specifications.
  */
-function getTypeByteSize(typeDef: any): number {
+function getTypeByteSize(typeDef: any, mraDir?: string): number {
   if (!typeDef) return 1;
+  
+  // Resolve $ref first - look up the actual definition and get its size
+  if (typeDef.$ref) {
+    const resolved = resolveRef(typeDef.$ref, mraDir);
+    if (resolved) {
+      return getTypeByteSize(resolved, mraDir);
+    }
+  }
+  
+  // Handle oneOf - look into each option to find the byte size
+  // Use the first option that has a definable size (typically the non-default value)
+  if (typeDef.oneOf && Array.isArray(typeDef.oneOf)) {
+    for (const option of typeDef.oneOf) {
+      // Skip default value markers (e.g., state_DefaultValue_00FF, state_DefaultValue_FF)
+      // These are single-byte sentinel values and should not determine the element size
+      if (option?.$ref && (option.$ref.includes('DefaultValue') || option.$ref.includes('_FF$'))) continue;
+      
+      const size = getTypeByteSize(option, mraDir);
+      if (size > 1) return size; // Prefer the option with larger size (the actual data type)
+    }
+    // If all options are single-byte or were skipped, fall through to default handling
+  }
   
   // Direct format specification (uint8, uint16, int16, uint32, etc.)
   if (typeDef.format) {
@@ -1199,144 +1330,4 @@ function getTypeByteSize(typeDef: any): number {
   return 1;
 }
 
-/**
- * Parse an object-type EPC value into named elements based on MRA definition.
- * 
- * For example, EPC 0xE2 (Historical data) has this structure:
- * - Element 1 "day": uint16 (2 bytes) - the date context
- * - Element 2 "electricEnergy": array of 48 items × 4 bytes each = 192 bytes
- * 
- * This function splits the raw hex into named elements with their byte ranges.
- */
-export function parseEpcElements(
-  pv: Uint8Array,
-  propertyData: any
-): {
-  elements: Array<{
-    name: string;
-    label?: string;
-    rawHex: string;
-    rawBytes: string[];
-    isObject: boolean;
-    itemSize?: number;
-    minItems?: number;
-    maxItems?: number;
-    items?: Array<{ index: number; rawHex: string; rawBytes: string[] }>;
-  }>;
-} {
-  const elements: typeof parseEpcElements.prototype.return.elements = [];
-  
-  if (!propertyData || propertyData.type !== 'object' || !propertyData.properties) {
-    return { elements };
-  }
-  
-  let offset = 0;
-  
-  for (const propDef of propertyData.properties) {
-    const elementName = propDef.shortName || '';
-    const label = propDef.elementName?.en || propDef.elementName?.ja || elementName;
-    
-    if (!elementName) continue;
-    
-    const rawBytes: string[] = [];
-    let isObjectArray = false;
-    let itemSize: number | undefined;
-    let minItems: number | undefined;
-    let maxItems: number | undefined;
-    const arrayItems: Array<{ index: number; rawHex: string; rawBytes: string[] }> = [];
-    
-    if (propDef.element?.type === 'array') {
-      // Array type - extract all items
-      isObjectArray = true;
-      itemSize = propDef.element.itemSize || 1;
-      minItems = propDef.element.minItems;
-      maxItems = propDef.element.maxItems;
-      
-      const remainingBytes = pv.length - offset;
-      const effectiveItemSize = itemSize!;
-      const itemCount = Math.floor(remainingBytes / effectiveItemSize);
-      
-      for (let i = 0; i < itemCount; i++) {
-        const start = offset + i * effectiveItemSize;
-        const end = Math.min(start + effectiveItemSize, pv.length);
-        const itemBytes: number[] = [];
-        
-        for (let j = start; j < end; j++) {
-          itemBytes.push(pv[j]);
-        }
-        
-        const hexStr = itemBytes.map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`).join(' ');
-        arrayItems.push({ index: i, rawHex: hexStr, rawBytes: itemBytes.map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`) });
-      }
-      
-      // Consume all remaining bytes for the array
-      while (offset < pv.length) {
-        rawBytes.push(`0x${pv[offset].toString(16).toUpperCase().padStart(2, '0')}`);
-        offset++;
-      }
-    } else {
-      // Scalar type - get byte size from definition
-      const byteSize = getTypeByteSize(propDef.element) || 1;
-      
-      for (let i = 0; i < byteSize && offset + i < pv.length; i++) {
-        rawBytes.push(`0x${pv[offset + i].toString(16).toUpperCase().padStart(2, '0')}`);
-      }
-      
-      offset += Math.min(byteSize, pv.length - offset);
-    }
-    
-    const hexStr = rawBytes.join(' ');
-    
-    elements.push({
-      name: elementName,
-      label: label || undefined,
-      rawHex: hexStr,
-      rawBytes,
-      isObject: isObjectArray,
-      itemSize,
-      minItems,
-      maxItems,
-      items: arrayItems.length > 0 ? arrayItems : undefined,
-    });
-  }
-  
-  return { elements };
-}
-
-/**
- * Main exported function: Parse an object/array-type EPC value into named elements.
- * Returns a structured result suitable for LLM consumption.
- */
-export function parseEpcElementsResult(
-  epc: number,
-  pv: Uint8Array,
-  propertyData: any,
-  propertyName?: string,
-  shortName?: string
-): {
-  epc: string;
-  propertyName: string;
-  shortName: string;
-  rawHex: string[];
-  elements: Array<{
-    name: string;
-    label?: string;
-    rawHex: string;
-    rawBytes: string[];
-    isObject: boolean;
-    itemSize?: number;
-    minItems?: number;
-    maxItems?: number;
-    items?: Array<{ index: number; rawHex: string; rawBytes: string[] }>;
-  }>;
-} {
-  const rawHex = Array.from(pv).map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`);
-  
-  return {
-    epc: `0x${epc.toString(16).toUpperCase()}`,
-    propertyName: propertyName || '',
-    shortName: shortName || '',
-    rawHex,
-    ...parseEpcElements(pv, propertyData),
-  };
-}
+// parseEpcElements and parseEpcElementsResult are defined above (lines ~250-360)

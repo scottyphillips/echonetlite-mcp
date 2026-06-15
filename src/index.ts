@@ -8,7 +8,7 @@ import { EchonetLiteClient } from './echonetlite.js';
 import { HomeAirConditioner } from './devices/homeAirConditioner.js';
 import { DEFAULT_HOST, HVAC_EOJGC, HVAC_EOJCC, HVAC_EOJ_INSTANCE, LITE_MODE } from './config.js';
 import type { HvacStatus, DiscoveredDevice, Eoj, NodeProfileData, DiscoveredDeviceFull } from './types.js';
-import { loadMraData, buildEojKey, getEojName, decodeEpcValue, getPropertyInfo, getRawMraPropertyData, loadDefinitions, resolveRef, getCoefficientRule, getAllCoefficientRules, getAllComplexRules, DecodedEpcValue } from './mra.js';
+import { loadMraData, buildEojKey, getEojName, decodeEpcValue, getPropertyInfo, getRawMraPropertyData, loadDefinitions, resolveRef, getCoefficientRule, getAllCoefficientRules, getAllComplexRules, parseEpcElementsResult, DecodedEpcValue } from './mra.js';
 
 // ============================================================================
 // Global State
@@ -88,7 +88,7 @@ server.registerTool(
       const discoveryTimeout = timeout || 5000;
       
       const device: DiscoveredDeviceFull = await client.discoverDevice(targetHost, discoveryTimeout);
-      const mraData = loadMraData();
+      const mraData = loadMraData() ?? new Map();
       
       const formattedResult = {
         host: device.host,
@@ -298,6 +298,7 @@ server.registerTool(
         const props: { epc: string; epcNum: number; name?: string; shortName?: string; description?: string }[] = [];
 
         const mraCache = loadMraData();
+        if (!mraCache) return [];
         const mraLookup = mraCache.get(eojKey);
 
         if (bytes.length < 17) {
@@ -697,6 +698,7 @@ server.registerTool(
 /** Search all EOJ types for the given EPC codes and return matches */
 function performCrossEojSearch(epcNums: number[]): Record<number, Array<{ eojKey: string; eoJName: string; propInfo: { name: string; shortName: string; accessRule: any; description?: string } }>> {
   const cache = loadMraData();
+  if (!cache) return {};
   const results: Record<number, Array<{ eojKey: string; eoJName: string; propInfo: { name: string; shortName: string; accessRule: any; description?: string } }>> = {};
 
   for (const epcNum of epcNums) {
@@ -841,6 +843,78 @@ server.registerTool(
     } catch (err) {
       return {
         content: [{ type: 'text', text: `Coefficient rules query failed: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ============================================================================
+// Generic EPC Element Parsing Tool (available in all modes)
+// This tool parses complex object/array-type EPC values into named elements.
+// ============================================================================
+
+server.registerTool(
+  'parse_epc_elements',
+  {
+    description: 'Parse an object/array-type ECHONETLite EPC value into named elements based on MRA definition. Returns structured element breakdown with raw hex bytes for each element, suitable for LLM consumption.\n\nWORKFLOW: After querying EPC data (e.g., EPC 0xE2), use this tool to split the raw bytes into named elements. Provide the EOJ type and property data from get_epc_definition or get_raw_property_data.',
+    inputSchema: {
+      epc: z.string().describe('EPC code in hex format (e.g., "0xE2")'),
+      host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
+      eojgc: z.string().optional().describe('EOJ Group Code in hex (e.g., "0x02"). Defaults to HVAC if not specified.'),
+      eojcc: z.string().optional().describe('EOJ Class Code in hex (e.g., "0x88"). Defaults to HVAC class if not specified.'),
+      eojInstance: z.string().optional().describe('EOJ Instance ID in hex (default: "0x01")'),
+      rawHex: z.string().describe('Raw hex bytes as space-separated values (e.g., "0x00 0x0A 0xFF 0xFF"). This is the EDT/PV data from a query_epc response.'),
+      propertyName: z.string().optional().describe('Property name for context (optional, looked up from MRA if not provided)'),
+      shortName: z.string().optional().describe('Short property name for context (optional, looked up from MRA if not provided)'),
+    },
+  },
+  async ({ epc, host, eojgc, eojcc, eojInstance, rawHex, propertyName, shortName }) => {
+    try {
+      // Parse raw hex string to Uint8Array
+      const hexBytes = rawHex.trim().split(/\s+/).map(h => {
+        const cleaned = h.replace(/^0x/i, '');
+        return parseInt(cleaned, 16);
+      });
+      const pv = new Uint8Array(hexBytes);
+
+      // Determine EOJ key from parameters or default to HVAC
+      let eojKey: string;
+      if (eojgc && eojcc) {
+        const gc = parseInt(eojgc.replace('0x', ''), 16);
+        const cc = parseInt(eojcc.replace('0x', ''), 16);
+        eojKey = buildEojKey(gc, cc);
+      } else {
+        // Default to HVAC
+        eojKey = buildEojKey(HVAC_EOJGC, HVAC_EOJCC);
+      }
+
+      // Get raw MRA property data for the EPC to use in element parsing
+      const epcNum = parseInt(epc.replace('0x', ''), 16);
+      const rawData = getRawMraPropertyData(epcNum, eojKey);
+
+      // Look up property info from MRA for context
+      const propInfo = getPropertyInfo(eojKey, epcNum);
+      const targetPropertyName = propertyName || (propInfo?.name || '');
+      const targetShortName = shortName || (propInfo?.shortName || '');
+
+      // Parse elements using the MRA definition data
+      // MRA data is now embedded via bundled JSON - no __dirname needed
+      const result = parseEpcElementsResult(
+        epcNum,
+        pv,
+        rawData, // propertyData - contains element definitions for object/array types
+        targetPropertyName,
+        targetShortName,
+        undefined // MRA data is loaded from embedded bundle via loadMraData()
+      );
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `EPC element parsing failed: ${(err as Error).message}` }],
         isError: true,
       };
     }
