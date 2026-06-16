@@ -605,10 +605,16 @@ export class EchonetLiteClient {
    * Parse STATMAP/SETMAP/GETMAP bitmap or raw EPC list data.
    * First byte is always a count (PDC) of following bytes.
    * 
-   * For short data (< 17 total bytes including count): raw EPC hex values
-   * For long data (>= 17 total bytes): bitmap format (_009X)
-   *   Each byte represents 8 EPCs: bit j set → EPC = (j + 8) * 16 + code
-   *   where code = byte_index - 1 (low nibble of EPC)
+   * Rule A - Short format (< 17 total bytes): Raw EPC hex values
+   *   Each byte after the count byte IS an EPC value directly.
+   *   
+   * Rule B - Long bitmap format (>= 17 total bytes): 16-byte bitmask (_009X)
+   *   Each byte encodes 8 contiguous EPCs starting from 0x80:
+   *   - Byte 1 (index 1): covers EPCs 0x80-0x87
+   *   - Byte 2 (index 2): covers EPCs 0x88-0x8F
+   *   - Byte 3 (index 3): covers EPCs 0x90-0x97
+   *   - ... continuing through byte 16: covers EPCs 0xF8-0xFF
+   *   Bit j set in byte → EPC = base_epc + bit_pos
    */
   private parsePropertyMapData(data: Uint8Array): { epc: number; ac: number | null }[] {
     const entries: { epc: number; ac: number | null }[] = [];
@@ -619,18 +625,18 @@ export class EchonetLiteClient {
     const totalBytes = data.length;
 
     if (totalBytes < 17) {
-      // Short format: each remaining byte IS an EPC value directly
+      // Rule A: Short format - each remaining byte IS an EPC value directly
       for (let i = 1; i < totalBytes; i++) {
         entries.push({ epc: data[i], ac: null });
       }
     } else {
-      // Long bitmap format (_009X): each byte encodes 8 EPCs
-      for (let i = 1; i < totalBytes; i++) {
-        const code = i - 1; // low nibble of EPC
-        const byteVal = data[i];
-        for (let j = 0; j < 8; j++) {
-          if (byteVal & (1 << j)) {
-            const epc = (j + 8) * 16 + code;
+      // Rule B: Long bitmap format (_009X) - each byte encodes 8 contiguous EPCs
+      for (let byteIdx = 1; byteIdx < totalBytes && byteIdx <= 17; byteIdx++) {
+        const byteVal = data[byteIdx];
+        const baseEpc = 0x80 + (byteIdx - 1) * 8; // 0x80, 0x88, 0x90, ..., 0xF8
+        for (let bitPos = 0; bitPos < 8; bitPos++) {
+          if (byteVal & (1 << bitPos)) {
+            const epc = baseEpc + bitPos;
             entries.push({ epc, ac: null });
           }
         }

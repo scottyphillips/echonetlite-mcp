@@ -49,7 +49,7 @@ const server = new McpServer({
 // ============================================================================
 // Tool Definitions - Lite Mode Tools (always registered)
 // These 6 tools are available in both lite and full mode:
-//   - discover_devices
+//   - discover_device
 //   - discover_nodes
 //   - set_epc
 //   - get_property_maps
@@ -343,6 +343,7 @@ server.registerTool(
         const mraLookup = mraCache.get(eojKey);
 
         if (bytes.length < 17) {
+          // Rule A: Short format - each remaining byte IS an EPC value directly
           for (let i = 1; i < bytes.length; i++) {
             const epcNum = bytes[i];
             const epcHex = `0x${epcNum.toString(16).toUpperCase()}`;
@@ -361,12 +362,14 @@ server.registerTool(
             });
           }
         } else {
-          for (let i = 1; i < bytes.length; i++) {
-            const code = i - 1;
-            const byteVal = bytes[i];
-            for (let j = 0; j < 8; j++) {
-              if (byteVal & (1 << j)) {
-                const epcNum = (j + 8) * 16 + code;
+          // Rule B: Long bitmap format (_009X) - each byte encodes 8 contiguous EPCs starting from 0x80
+          // Byte 1 (index 1): covers EPCs 0x80-0x87, Byte 2: 0x88-0x8F, etc.
+          for (let byteIdx = 1; byteIdx < bytes.length && byteIdx <= 17; byteIdx++) {
+            const byteVal = bytes[byteIdx];
+            const baseEpc = 0x80 + (byteIdx - 1) * 8; // 0x80, 0x88, 0x90, ..., 0xF8
+            for (let bitPos = 0; bitPos < 8; bitPos++) {
+              if (byteVal & (1 << bitPos)) {
+                const epcNum = baseEpc + bitPos;
                 const epcHex = `0x${epcNum.toString(16).toUpperCase()}`;
                 
                 let propInfo: { name: string; shortName: string; accessRule: any; description?: string } | undefined;
