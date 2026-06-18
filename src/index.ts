@@ -310,7 +310,7 @@ server.registerTool(
 server.registerTool(
   'get_property_maps',
   {
-    description: 'Query all property maps (STATMAP/SETMAP/GETMAP) of an ECHONETLite object using standardized EPCs 0x9D, 0x9E, 0x9F. Returns the status change announcement EPC list (STATMAP), settable properties (SETMAP), and readable properties (GETMAP) with MRA-based property names and descriptions.',
+    description: 'Query all property maps (STATMAP/SETMAP/GETMAP) of an ECHONETLite object using standardized EPCs 0x9D, 0x9E, 0x9F. Returns the status change announcement EPC list (STATMAP), settable properties (SETMAP), and readable properties (GETMAP). Each EPC is enriched with MRA-based property names/descriptions, capabilities (get/set), and for SETMAP entries: compact value hints showing what values can be set (enum options as hex+name pairs, number/level ranges).\n\nWORKFLOW ROLE: This is the PRIMARY tool for discovering what properties a device supports and what values they accept. The enriched SETMAP data gives LLMs everything needed to set properties without calling get_epc_definition separately.',
     inputSchema: {
       host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
       eojgc: z.string().optional().describe('EOJ Group Code in hex (e.g., "0x01")'),
@@ -333,14 +333,114 @@ server.registerTool(
       const eojKey = buildEojKey(destinationEoj.groupCode, destinationEoj.classCode);
       const eoJName = getEojName(eojKey);
 
-      const parsePropertyMap = (epcDataItem: { epc: number; pv: Uint8Array }): { epc: string; epcNum: number; name?: string; shortName?: string; description?: string }[] => {
+      const parsePropertyMap = (epcDataItem: { epc: number; pv: Uint8Array }, isSetmap: boolean): Array<{ epc: string; epcNum: number; name?: string; shortName?: string; description?: string; capabilities?: { get: boolean; set: boolean }; values?: any }> => {
         if (epcDataItem.pv.length === 0) return [];
         const bytes = Array.from(epcDataItem.pv);
-        const props: { epc: string; epcNum: number; name?: string; shortName?: string; description?: string }[] = [];
+        const props: Array<{ epc: string; epcNum: number; name?: string; shortName?: string; description?: string; capabilities?: { get: boolean; set: boolean }; values?: any }> = [];
 
         const mraCache = loadMraData();
         if (!mraCache) return [];
         const mraLookup = mraCache.get(eojKey);
+
+        /**
+         * Enrich an EPC with capabilities and compact value hints from MRA definitions.
+         * For SETMAP EPCs: includes value hints (enum values, ranges) for what can be set.
+         * For non-settable EPCs: only includes capabilities.
+         */
+        const enrichEpcWithMraData = (epcNum: number): { capabilities?: { get: boolean; set: boolean }; values?: any } | null => {
+          if (!mraLookup) return null;
+          
+          const propInfo = mraLookup.properties.get(epcNum);
+          if (!propInfo || !propInfo.accessRule) return null;
+          
+          const ar = propInfo.accessRule;
+          if (!ar?.get && !ar?.set) return null;
+          const capabilities: { get: boolean; set: boolean } = {
+            get: ['required', 'optional'].includes(ar.get || ''),
+            set: ['required', 'optional'].includes(ar.set || ''),
+          };
+          
+          // Only resolve values for SETMAP EPCs that support setting
+          if (!isSetmap || !ar.set) {
+            return { capabilities };
+          }
+          
+          // Get raw MRA property data to determine value types
+          if (!eojKey) return { capabilities };
+          let rawData = getRawMraPropertyData(epcNum, eojKey);
+          
+          // Fallback: If not found in this specific EOJ, search all EOJs for inline enum definitions.
+          // This handles cases where the EPC exists across multiple device types but only has
+          // inline (non-$ref) definitions in some of them.
+          if (!rawData && mraCache) {
+            for (const [otherEojKey, otherLookup] of mraCache.entries()) {
+              const otherRaw = getRawMraPropertyData(epcNum, otherEojKey);
+              // Look for state types with inline enum data
+              if (otherRaw && otherRaw.type === 'state' && otherRaw.enum && otherRaw.enum.length > 0) {
+                rawData = otherRaw;
+                break;
+              }
+            }
+          }
+          
+          if (!rawData) return { capabilities };
+          
+          // Resolve $ref if present
+          let resolvedDef: any = null;
+          if (rawData?.$ref) {
+            resolvedDef = resolveRef(rawData.$ref);
+          }
+          
+          const propertyType = rawData?.type || resolvedDef?.type;
+          let values: any = undefined;
+          
+          // For state types: enum can be on rawData (inline) or resolvedDef ($ref)
+          if (propertyType === 'state') {
+            const enumData = rawData?.enum || resolvedDef?.enum;
+            if (enumData) {
+              values = enumData.map((e: any) => ({
+                hex: `0x${parseInt(e.edt).toString(16).toUpperCase()}`,
+                name: e.descriptions?.en || e.name,
+              }));
+            }
+          } else if (propertyType === 'number' && resolvedDef) {
+            // Number type - compact range format
+            const unit = resolvedDef.unit ? ` ${resolvedDef.unit}` : '';
+            values = `${resolvedDef.minimum ?? 0}-${resolvedDef.maximum ?? '?'}${unit} (${resolvedDef.format || 'unknown'})`;
+          } else if (propertyType === 'level' && resolvedDef) {
+            // Level type - compact range format
+            const base = parseInt(resolvedDef.base, 16);
+            const maxLevel = resolvedDef.maximum;
+            values = `${base.toString(16).toUpperCase()}-${(base + maxLevel - 1).toString(16).toUpperCase()} (${maxLevel} levels, base=${resolvedDef.base})`;
+          } else if (rawData?.oneOf) {
+            // oneOf type - combine available options compactly
+            values = rawData.oneOf.map((option: any) => {
+              if (option?.$ref) {
+                const optResolved = resolveRef(option.$ref);
+                if (optResolved?.type === 'state' && optResolved?.enum) {
+                  return { hex: `0x${parseInt(optResolved.enum[0]?.edt || '0', 16).toString(16).toUpperCase()}`, name: optResolved.enum[0]?.descriptions?.en || option.$ref };
+                } else if (optResolved?.type === 'number') {
+                  const unit = optResolved.unit ? ` ${optResolved.unit}` : '';
+                  return `${optResolved.minimum ?? 0}-${optResolved.maximum ?? '?'}${unit} (${optResolved.format || 'unknown'})`;
+                } else if (optResolved?.type === 'level') {
+                  const base = parseInt(optResolved.base, 16);
+                  const maxLevel = optResolved.maximum;
+                  return `${base.toString(16).toUpperCase()}-${(base + maxLevel - 1).toString(16).toUpperCase()} (${maxLevel} levels)`;
+                }
+              } else if (option?.type === 'state' && option?.enum) {
+                const e = option.enum[0];
+                return { hex: `0x${parseInt(e.edt || '0', 16).toString(16).toUpperCase()}`, name: e.descriptions?.en || e.name };
+              }
+              return null;
+            }).filter((v: any) => v !== null);
+          }
+          
+          if (values === undefined || values.length === 0) {
+            return { capabilities };
+          }
+          
+          return { capabilities, values };
+        };
 
         if (bytes.length < 17) {
           // Rule A: Short format - each remaining byte IS an EPC value directly
@@ -353,13 +453,25 @@ server.registerTool(
               propInfo = mraLookup.properties.get(epcNum);
             }
 
-            props.push({ 
+            const enrichment = enrichEpcWithMraData(epcNum);
+            const baseProp: any = { 
               epc: epcHex, 
               epcNum,
               name: propInfo?.name || undefined,
               shortName: propInfo?.shortName || undefined,
               description: propInfo?.description || undefined,
-            });
+            };
+            
+            if (enrichment) {
+              if (enrichment.values !== undefined) {
+                baseProp.capabilities = enrichment.capabilities;
+                baseProp.values = enrichment.values;
+              } else {
+                baseProp.capabilities = enrichment.capabilities;
+              }
+            }
+
+            props.push(baseProp);
           }
         } else {
           // Rule B: Long bitmap format (_009X) - each byte encodes 8 contiguous EPCs starting from 0x80
@@ -377,13 +489,25 @@ server.registerTool(
                   propInfo = mraLookup.properties.get(epcNum);
                 }
 
-                props.push({ 
+                const enrichment = enrichEpcWithMraData(epcNum);
+                const baseProp: any = { 
                   epc: epcHex, 
                   epcNum,
                   name: propInfo?.name || undefined,
                   shortName: propInfo?.shortName || undefined,
                   description: propInfo?.description || undefined,
-                });
+                };
+                
+                if (enrichment) {
+                  if (enrichment.values !== undefined) {
+                    baseProp.capabilities = enrichment.capabilities;
+                    baseProp.values = enrichment.values;
+                  } else {
+                    baseProp.capabilities = enrichment.capabilities;
+                  }
+                }
+
+                props.push(baseProp);
               }
             }
           }
@@ -400,9 +524,9 @@ server.registerTool(
         content: [{ type: 'text', text: JSON.stringify({ 
           eoJ: destinationEoj, 
           eoJName,
-          statmap: parsePropertyMap(statmapData || { epc: 0x9d, pv: new Uint8Array([]) }),
-          setmap: parsePropertyMap(setmapData || { epc: 0x9e, pv: new Uint8Array([]) }),
-          getmap: parsePropertyMap(getmapData || { epc: 0x9f, pv: new Uint8Array([]) }),
+          statmap: parsePropertyMap(statmapData || { epc: 0x9d, pv: new Uint8Array([]) }, false),
+          setmap: parsePropertyMap(setmapData || { epc: 0x9e, pv: new Uint8Array([]) }, true),
+          getmap: parsePropertyMap(getmapData || { epc: 0x9f, pv: new Uint8Array([]) }, false),
           description: 'STATMAP(0x9D)=status notification EPCs, SETMAP(0x9E)=settable props, GETMAP(0x9F)=readable props.'
         }, null, 2) }],
       };
@@ -419,7 +543,7 @@ server.registerTool(
 server.registerTool(
   'query_epc',
   {
-    description: 'Query one or more EPC (EPC Property Code) codes from an actual ECHONETLite device and return the current raw value and human-readable decoded value. Sends a GET request to the device with all requested EPCs, receives the actual values, then decodes each using MRA enrichment data.\n\nWORKFLOW PRIORITY: 1) First discover nodes on the device, 2) Then discover property maps (STATMAP/SETMAP/GETMAP), 3) Look up EPC definitions using get_epc_definition to understand what each property represents, 4) AFTER getting EPC definitions, use search_definitions to look up any referenced definition names (e.g., "state_ON-OFF_3031", "level_31-8", "number_-12.7-12.5Celsius") found in the $ref field or enum/value type fields - this gives you the actual enum values, bitmaps, level ranges, and number formats needed to interpret raw bytes, 5) If any properties require coefficient multiplication (check for "coefficientRule" in response), query those coefficient EPCs and multiply, 6) Calculate final values.\n\nNOTE: Coefficients are NOT needed for all devices. Simple devices like HVAC units return direct values. Check the coefficientRule field only if present in the response.',
+    description: 'Query one or more EPC (EPC Property Code) codes from an actual ECHONETLite device and return the current raw value and human-readable decoded value. Sends a GET request to the device with all requested EPCs, receives the actual values, then decodes each using MRA enrichment data.\n\nWORKFLOW PRIORITY: 1) First discover nodes on the device, 2) Then use get_property_maps which includes enriched capabilities AND settable values (enum options, ranges) directly in STATMAP/SETMAP/GETMAP - no need to call get_epc_definition separately for normal properties. 3) If any properties require coefficient multiplication (check for "coefficientRule" in response), query those coefficient EPCs and multiply, 4) Calculate final values.\n\nNOTE: Coefficients are NOT needed for all devices. Simple devices like HVAC units return direct values. Check the coefficientRule field only if present in the response.\n\nEDGE CASES: get_epc_definition is only needed when you need to understand a property\'s full MRA definition (e.g., complex object/array types, or EPCs not found in property maps).',
     inputSchema: {
       epcs: z.array(z.string()).describe('EPC codes in hex format (e.g., ["0xBB", "0xB3"] for temperatures, ["0x80"] for operation status). Supports multiple EPCs.'),
       host: z.string().optional().describe(`IP address of the device (default: ${DEFAULT_HOST})`),
@@ -775,7 +899,7 @@ function performCrossEojSearch(epcNums: number[]): Record<number, Array<{ eojKey
 server.registerTool(
   'search_definitions',
   {
-    description: 'Search all ECHONETLite MRA definitions by name or type pattern. Useful for finding definitions like "level_31-8", "state_ON-OFF_4142", etc. without knowing the exact EPC code. Returns matching definition names, types (state/number/level/bitmap), and their full resolved content.\n\nWORKFLOW ROLE: This tool is called AFTER get_epc_definition when the EPC definition contains a $ref field or references a definition name. For example:\n- If get_epc_definition returns "$ref": "#/definitions/state_ON-OFF_3031", use search_definitions with pattern "ON-OFF" to find and retrieve that definition\n- If the property type is "level_31-8", use search_definitions with pattern "level_31" to get the base value (0x31) and maximum level count\n- If the property type is a number like "number_-12.7-12.5Celsius", use search_definitions with pattern "Celsius" to get the format (uint8/uint16/int16), unit, and multiple factors\n\nThe definition content contains the actual enum values, bitmap bit positions, level ranges, or number formats needed to decode raw bytes into human-readable values.',
+    description: 'Search all ECHONETLite MRA definitions by name or type pattern. Returns matching definition names, types (state/number/level/bitmap), and their full resolved content.\n\nWORKFLOW ROLE: This is an EDGE-CASE tool for when get_property_maps enrichment doesn\'t provide enough detail. Use it to look up complex $ref definitions (e.g., "level_31-8" for fan speed, "state_ON-OFF_3031" for on/off states) that weren\'t resolved inline in property maps.',
     inputSchema: {
       pattern: z.string().describe('Search pattern to match against definition names (e.g., "level_31" for fan speed levels, "ON-OFF" for on/off states, "Celsius" for temperature numbers). Supports partial matching.'),
     },
@@ -830,7 +954,7 @@ server.registerTool(
 server.registerTool(
   'query_coefficient_rules',
   {
-    description: 'Query ALL coefficient rules for a specific device type (EOJ). This tool SCANS the MRA device definition JSON to find ANY properties that require coefficient multiplication.\n\nCOEFFICIENTS CAN APPEAR ON ANY DEVICE TYPE - not just meters. Any ECHONETLite device may define properties with coefficients in their MRA JSON definition. Coefficients are indicated by a "coefficient" array in the property data definition.\n\nWORKFLOW FOR LLMs (coefficients are LAST priority):\n1. First discover nodes to identify all EOJ types on the device\n2. Then discover property maps (STATMAP/SETMAP/GETMAP) to see available EPCs\n3. Look up EPC definitions using get_epc_definition to understand each property\n4. AFTER step 3, use search_definitions to look up any referenced definition names ($ref values like "state_ON-OFF_3031", "level_31-8", etc.) - this gives you enum/bitmap/level details needed to decode raw bytes\n5. ONLY IF steps 3-4 reveal coefficient requirements, use this tool or check for coefficientRule in query_epc responses\n6. For simple devices (HVAC, sensors with direct values), coefficients are NOT needed - read values directly\n7. For metering devices (energy meters, gas meters, water meters), coefficients ARE typically required\n\nUSAGE: Provide EOJ group code (eojgc) and class code (eojcc) for the device type.',
+    description: 'Query ALL coefficient rules for a specific device type (EOJ). This tool SCANS the MRA device definition JSON to find ANY properties that require coefficient multiplication.\n\nCOEFFICIENTS CAN APPEAR ON ANY DEVICE TYPE - not just meters. Any ECHONETLite device may define properties with coefficients in their MRA JSON definition.\n\nWORKFLOW FOR LLMs (coefficients are LAST priority):\n1. First discover nodes to identify all EOJ types on the device\n2. Then use get_property_maps which includes enriched capabilities AND settable values - no need for separate EPC definition lookups\n3. If query_epc responses include "coefficientRule", query those coefficient EPCs and multiply raw values\n4. For simple devices (HVAC, sensors with direct values), coefficients are NOT needed\n5. For metering devices (energy meters, gas meters, water meters), coefficients ARE typically required\n\nUSAGE: Provide EOJ group code (eojgc) and class code (eojcc) for the device type.',
     inputSchema: {
       eojgc: z.string().describe('EOJ Group Code in hex (e.g., "0x02" for energy meter)'),
       eojcc: z.string().describe('EOJ Class Code in hex (e.g., "0x88" for low-voltage smart electric energy meter)'),
