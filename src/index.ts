@@ -49,7 +49,7 @@ const server = new McpServer({
 // ============================================================================
 // Tool Definitions - Lite Mode Tools (always registered)
 // These 6 tools are available in both lite and full mode:
-//   - discover_device
+// 
 //   - discover_nodes
 //   - set_epc
 //   - get_property_maps
@@ -944,6 +944,270 @@ server.registerTool(
     } catch (err) {
       return {
         content: [{ type: 'text', text: `Definition search failed: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+/** Query instance definitions - returns all EPC values with full enrichment from MRA definitions (no network needed) */
+server.registerTool(
+  'query_instance_definitions',
+  {
+    description: 'Query all EPC property definitions for a specific EOJ type from the MRA database (no network required). Returns ALL possible EPC codes with complete enrichment data including property names, descriptions, access capabilities (GET/SET), and full value definitions (enum options, level ranges, number formats with units).\n\nWORKFLOW ROLE: This is the PRIMARY tool for emulator development and reverse engineering. Unlike get_property_maps which queries a live device, this tool reads directly from MRA definition files - making it useful even when no physical device is available. Returns complete EPC catalogs with all possible values needed to build/validate emulator responses.',
+    inputSchema: {
+      eojgc: z.string().describe('EOJ Group Code in hex (e.g., "0x01" for HVAC, "0x02" for energy meter)'),
+      eojcc: z.string().describe('EOJ Class Code in hex (e.g., "0x30" for home air conditioner, "0x88" for low-voltage smart electric energy meter)'),
+    },
+  },
+  async ({ eojgc, eojcc }) => {
+    try {
+      const gc = parseInt(eojgc.replace('0x', ''), 16);
+      const cc = parseInt(eojcc.replace('0x', ''), 16);
+      const eojKey = buildEojKey(gc, cc);
+
+      // Load MRA data
+      const mraData = loadMraData();
+      if (!mraData) {
+        return {
+          content: [{ type: 'text', text: 'Failed to load MRA data' }],
+          isError: true,
+        };
+      }
+
+      const lookup = mraData.get(eojKey);
+      if (!lookup) {
+        // Try to find similar EOJ types
+        const similarEojTypes: string[] = [];
+        for (const [key] of mraData.entries()) {
+          if (key.startsWith(`0x${gc.toString(16).toUpperCase().padStart(2, '0')}`)) {
+            similarEojTypes.push(`${key} (${getEojName(key)})`);
+          }
+        }
+        
+        return {
+          content: [{ 
+            type: 'text', 
+            text: JSON.stringify({
+              error: `EOJ type not found in MRA data`,
+              requested: eojKey,
+              eoJName: getEojName(eojKey),
+              similarEojTypes: similarEojTypes.slice(0, 20),
+            }, null, 2) 
+          }],
+          isError: true,
+        };
+      }
+
+      // Enrichment function - same logic as get_property_maps but works on raw MRA data
+      const enrichEpcWithFullDefinition = (epcNum: number): { 
+        capabilities?: { get: boolean; set: boolean; inf?: string }; 
+        values?: any[];
+        definition?: any;
+      } | null => {
+        const propInfo = lookup.properties.get(epcNum);
+        if (!propInfo || !propInfo.accessRule) return null;
+
+        const ar = propInfo.accessRule;
+        const capabilities: { get: boolean; set: boolean; inf?: string } = {
+          get: ['required', 'optional'].includes(ar.get || ''),
+          set: ['required', 'optional'].includes(ar.set || ''),
+        };
+        if (ar.inf) {
+          capabilities.inf = ar.inf;
+        }
+
+        // Get raw MRA property data for value definitions
+        let rawData = getRawMraPropertyData(epcNum, eojKey);
+        
+        // Fallback: search all EOJs for inline enum definitions
+        if (!rawData && mraData) {
+          for (const [otherEojKey, otherLookup] of mraData.entries()) {
+            const otherRaw = getRawMraPropertyData(epcNum, otherEojKey);
+            if (otherRaw && otherRaw.type === 'state' && otherRaw.enum && otherRaw.enum.length > 0) {
+              rawData = otherRaw;
+              break;
+            }
+          }
+        }
+
+        if (!rawData) {
+          return { capabilities };
+        }
+
+        // Resolve $ref if present
+        let resolvedDef: any = null;
+        if (rawData?.$ref) {
+          resolvedDef = resolveRef(rawData.$ref);
+        }
+
+        const propertyType = rawData?.type || resolvedDef?.type;
+        let values: any[] = [];
+
+        // State type with enum values
+        if (propertyType === 'state') {
+          const enumData = rawData?.enum || resolvedDef?.enum;
+          if (enumData && Array.isArray(enumData)) {
+            values = enumData.map((e: any) => ({
+              hex: `0x${parseInt(e.edt).toString(16).toUpperCase()}`,
+              name: e.descriptions?.en || e.name,
+              description: e.descriptions?.en || e.descriptions?.ja || '',
+            }));
+          }
+        }
+        // Level type with base and maximum levels
+        else if (propertyType === 'level' && resolvedDef) {
+          const base = parseInt(resolvedDef.base, 16);
+          const maxLevel = resolvedDef.maximum;
+          for (let i = 0; i < maxLevel; i++) {
+            values.push({
+              hex: `0x${(base + i).toString(16).toUpperCase()}`,
+              name: `Level ${i + 1}`,
+              description: resolvedDef.descriptions?.en || '',
+            });
+          }
+        }
+        // Number type with range info
+        else if (propertyType === 'number' && resolvedDef) {
+          const unit = resolvedDef.unit ? ` ${resolvedDef.unit}` : '';
+          values.push({
+            format: resolvedDef.format,
+            range: `${resolvedDef.minimum ?? 0}-${resolvedDef.maximum ?? '?'}${unit}`,
+            multiple: resolvedDef.multiple || 1,
+            description: resolvedDef.descriptions?.en || '',
+          });
+        }
+        // Bitmap type with bit definitions
+        else if (propertyType === 'bitmap' && resolvedDef?.bitmaps) {
+          for (const bitmap of resolvedDef.bitmaps) {
+            if (bitmap.name && bitmap.value?.enum) {
+              const enumValues = bitmap.value.enum.map((e: any) => ({
+                hex: `0x${parseInt(e.edt).toString(16).toUpperCase()}`,
+                name: e.descriptions?.en || e.name,
+              }));
+              values.push({
+                position: bitmap.position,
+                name: bitmap.name,
+                enumValues: enumValues,
+              });
+            }
+          }
+        }
+        // oneOf type with multiple options
+        else if (rawData?.oneOf) {
+          values = rawData.oneOf.map((option: any) => {
+            if (option?.$ref) {
+              const optResolved = resolveRef(option.$ref);
+              if (optResolved?.type === 'state' && optResolved?.enum) {
+                return optResolved.enum.map((e: any) => ({
+                  hex: `0x${parseInt(e.edt).toString(16).toUpperCase()}`,
+                  name: e.descriptions?.en || e.name,
+                  description: e.descriptions?.en || '',
+                }));
+              } else if (optResolved?.type === 'number') {
+                const unit = optResolved.unit ? ` ${optResolved.unit}` : '';
+                return {
+                  format: optResolved.format,
+                  range: `${optResolved.minimum ?? 0}-${optResolved.maximum ?? '?'}${unit}`,
+                  multiple: optResolved.multiple || 1,
+                };
+              } else if (optResolved?.type === 'level') {
+                const base = parseInt(optResolved.base, 16);
+                const maxLevel = optResolved.maximum;
+                return {
+                  range: `${base.toString(16).toUpperCase()}-${(base + maxLevel - 1).toString(16).toUpperCase()} (${maxLevel} levels)`,
+                };
+              }
+            } else if (option?.type === 'state' && option?.enum) {
+              return option.enum.map((e: any) => ({
+                hex: `0x${parseInt(e.edt).toString(16).toUpperCase()}`,
+                name: e.descriptions?.en || e.name,
+                description: e.descriptions?.en || '',
+              }));
+            }
+            return null;
+          }).filter((v: any) => v !== null);
+        }
+
+        const result: { capabilities?: { get: boolean; set: boolean; inf?: string }; values?: any[]; definition?: any } = { capabilities };
+        if (values.length > 0) {
+          result.values = values;
+        }
+        if (rawData?.coefficient) {
+          result.definition = { coefficient: rawData.coefficient };
+        }
+        return result;
+      };
+
+      // Build complete EPC catalog from MRA definition
+      const epcCatalog: Array<{
+        epc: string;
+        epcNum: number;
+        name: string;
+        shortName: string;
+        description: string;
+        capabilities: { get: boolean; set: boolean; inf?: string };
+        values?: any[];
+        coefficientRule?: any;
+      }> = [];
+
+      for (const [epcNum, propInfo] of lookup.properties.entries()) {
+        const enrichment = enrichEpcWithFullDefinition(epcNum);
+        
+        const entry: any = {
+          epc: `0x${epcNum.toString(16).toUpperCase()}`,
+          epcNum,
+          name: propInfo.name,
+          shortName: propInfo.shortName,
+          description: propInfo.description || '',
+          capabilities: enrichment?.capabilities || { get: false, set: false },
+        };
+
+        if (enrichment?.values && enrichment.values.length > 0) {
+          entry.values = enrichment.values;
+        }
+
+        // Check for coefficient rules
+        const coeffRule = getCoefficientRule(epcNum, eojKey);
+        if (coeffRule) {
+          entry.coefficientRule = {
+            requiresCoefficient: true,
+            sourceProperty: coeffRule.sourceShortName,
+            instruction: coeffRule.instruction,
+            coefficientEpcs: coeffRule.coefficientEpcs.map((e: number) => `0x${e.toString(16).toUpperCase()}`),
+          };
+        }
+
+        epcCatalog.push(entry);
+      }
+
+      // Sort by EPC number for consistent output
+      epcCatalog.sort((a, b) => a.epcNum - b.epcNum);
+
+      const output = {
+        eoJKey: eojKey,
+        eoJName: lookup.eoJName,
+        shortName: lookup.shortName,
+        totalEpcs: epcCatalog.length,
+        epcSummary: {
+          readable: epcCatalog.filter(e => e.capabilities.get).length,
+          settable: epcCatalog.filter(e => e.capabilities.set).length,
+          withValues: epcCatalog.filter(e => e.values && e.values.length > 0).length,
+          withCoefficientRules: epcCatalog.filter(e => e.coefficientRule).length,
+        },
+        definitions: {
+          description: 'Complete EPC catalog with all possible values from MRA definitions',
+          note: 'This data is read directly from MRA definition files - no network connection required. Use this to build emulator response templates.',
+        },
+        epcCatalog,
+      };
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Instance definitions query failed: ${(err as Error).message}` }],
         isError: true,
       };
     }
