@@ -307,4 +307,5 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 For issues, questions, or contributions, please open an issue on [GitHub](https://github.com/scottyphillips/echonetlite-mcp/issues).
 
-[![Buy Me A Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)]([https://www.buymeacoffee.com/rgkwgyt](https://buymeacoffee.com/rgkwqyt))
+[![Buy Me A Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://www.buymeacoffee.com/RgKWqyt)
+
