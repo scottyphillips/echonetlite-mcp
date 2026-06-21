@@ -617,34 +617,44 @@ export class EchonetLiteClient {
    *   Bit j set in byte → EPC = base_epc + bit_pos
    */
   private parsePropertyMapData(data: Uint8Array): { epc: number; ac: number | null }[] {
-    const entries: { epc: number; ac: number | null }[] = [];
+      const entries: { epc: number; ac: number | null }[] = [];
 
-    if (data.length < 2) return entries;
+      if (data.length < 2) return entries;
 
-    // First byte is count/PDC - skip it
-    const totalBytes = data.length;
+      // Byte 0 defines how many properties exist
+      const propertyCount = data[0]; 
 
-    if (totalBytes < 17) {
-      // Rule A: Short format - each remaining byte IS an EPC value directly
-      for (let i = 1; i < totalBytes; i++) {
-        entries.push({ epc: data[i], ac: null });
-      }
-    } else {
-      // Rule B: Long bitmap format (_009X) - each byte encodes 8 contiguous EPCs
-      for (let byteIdx = 1; byteIdx < totalBytes && byteIdx <= 17; byteIdx++) {
-        const byteVal = data[byteIdx];
-        const baseEpc = 0x80 + (byteIdx - 1) * 8; // 0x80, 0x88, 0x90, ..., 0xF8
-        for (let bitPos = 0; bitPos < 8; bitPos++) {
-          if (byteVal & (1 << bitPos)) {
-            const epc = baseEpc + bitPos;
-            entries.push({ epc, ac: null });
+      if (propertyCount < 16) {
+        // Rule A: Short format - the next `propertyCount` bytes are explicit EPCs
+        for (let i = 1; i <= propertyCount && i < data.length; i++) {
+          entries.push({ epc: data[i], ac: null });
+        }
+      } else {
+        // Rule B: Long bitmap format - exactly 16 bytes following the count
+        for (let byteIdx = 1; byteIdx <= 16 && byteIdx < data.length; byteIdx++) {
+          const byteVal = data[byteIdx];
+          
+          for (let bitPos = 0; bitPos < 8; bitPos++) {
+            // If the bit at this position is flipped to 1...
+            if (byteVal & (1 << bitPos)) {
+              // Reverse the nibble math:
+              // 1. Bit position (0-7) + 8 gives us the upper nibble (8-F)
+              const upperNibble = (bitPos + 8) << 4;
+              
+              // 2. Byte index (1-16) - 1 gives us the lower nibble (0-F)
+              const lowerNibble = byteIdx - 1;
+              
+              // 3. Combine them to get the actual EPC
+              const epc = upperNibble | lowerNibble;
+              
+              entries.push({ epc, ac: null });
+            }
           }
         }
       }
-    }
 
-    return entries;
-  }
+      return entries;
+    }
 
   /**
    * Query all property maps (STATMAP, SETMAP, GETMAP) of an ECHONETLite object.
@@ -654,7 +664,7 @@ export class EchonetLiteClient {
   async getAllPropertyMaps(
     host: string,
     destinationEoj?: Eoj
-  ): Promise<EpcData[]> {
+  ): Promise<Map<number, { epc: number; ac: number | null }[]>> {
     const packet: EchonetPacket = {
       header: { echonetVersion: [0x10, 0x81], tid: 0 },
       sourceEoj: { groupCode: DEFAULT_SEOJ_GROUP, classCode: DEFAULT_SEOJ_CLASS, instanceId: 0xff },
@@ -668,7 +678,22 @@ export class EchonetLiteClient {
     };
 
     const response = await this.sendRequest(host, packet);
-    return response.epcData;
+    
+    // Parse each property map's PV data using parsePropertyMapData
+    const result = new Map<number, { epc: number; ac: number | null }[]>();
+    
+    for (const epcData of response.epcData) {
+      const parsedEntries = this.parsePropertyMapData(epcData.pv);
+      // Update AC values from the original EpcData if available
+      if (epcData.ac !== undefined && epcData.ac > 0) {
+        for (const entry of parsedEntries) {
+          entry.ac = epcData.ac;
+        }
+      }
+      result.set(epcData.epc, parsedEntries);
+    }
+    
+    return result;
   }
 
   /**

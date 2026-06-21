@@ -516,17 +516,18 @@ server.registerTool(
         return props;
       };
 
-      const statmapData = result.find(r => r.epc === 0x9d);
-      const setmapData = result.find(r => r.epc === 0x9e);
-      const getmapData = result.find(r => r.epc === 0x9f);
+      // Now that getAllPropertyMaps returns a Map with parsed entries, we extract the parsed lists directly
+      const statmapEntries = result.get(0x9d) || [];
+      const setmapEntries = result.get(0x9e) || [];
+      const getmapEntries = result.get(0x9f) || [];
 
       return {
         content: [{ type: 'text', text: JSON.stringify({ 
           eoJ: destinationEoj, 
           eoJName,
-          statmap: parsePropertyMap(statmapData || { epc: 0x9d, pv: new Uint8Array([]) }, false),
-          setmap: parsePropertyMap(setmapData || { epc: 0x9e, pv: new Uint8Array([]) }, true),
-          getmap: parsePropertyMap(getmapData || { epc: 0x9f, pv: new Uint8Array([]) }, false),
+          statmap: statmapEntries,
+          setmap: setmapEntries,
+          getmap: getmapEntries,
           description: 'STATMAP(0x9D)=status notification EPCs, SETMAP(0x9E)=settable props, GETMAP(0x9F)=readable props.'
         }, null, 2) }],
       };
