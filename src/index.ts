@@ -516,10 +516,121 @@ server.registerTool(
         return props;
       };
 
-      // Now that getAllPropertyMaps returns a Map with parsed entries, we extract the parsed lists directly
-      const statmapEntries = result.get(0x9d) || [];
-      const setmapEntries = result.get(0x9e) || [];
-      const getmapEntries = result.get(0x9f) || [];
+      // Enrich the parsed entries with MRA data (names, descriptions, capabilities, values)
+      const mraCache = loadMraData();
+      const mraLookup = mraCache?.get(eojKey);
+
+      const enrichParsedEntry = (entry: { epc: number; ac: number | null }, isSetmap: boolean): any => {
+        const epcNum = entry.epc;
+        const acValue = entry.ac;
+
+        // Look up property info from MRA
+        let propInfo: { name: string; shortName: string; accessRule: any; description?: string } | undefined;
+        if (mraLookup) {
+          propInfo = mraLookup.properties.get(epcNum);
+        }
+
+        const baseProp: any = { 
+          epc: `0x${epcNum.toString(16).toUpperCase()}`, 
+          epcNum,
+          name: propInfo?.name || undefined,
+          shortName: propInfo?.shortName || undefined,
+          description: propInfo?.description || undefined,
+        };
+
+        // Determine capabilities from AC value and MRA data
+        const capabilities: { get: boolean; set: boolean } = {
+          get: !!(acValue !== null && (acValue & 0x10)),
+          set: !!(acValue !== null && (acValue & 0x04)),
+        };
+
+        // Also check MRA accessRule for more accurate capabilities
+        if (propInfo?.accessRule) {
+          const ar = propInfo.accessRule;
+          capabilities.get = ['required', 'optional'].includes(ar.get || '');
+          if (!isSetmap) {
+            capabilities.set = false;
+          } else {
+            capabilities.set = ['required', 'optional'].includes(ar.set || '');
+          }
+        }
+
+        baseProp.capabilities = capabilities;
+
+        // For SETMAP entries: resolve settable values from MRA definitions
+        if (isSetmap && mraLookup) {
+          let rawData = getRawMraPropertyData(epcNum, eojKey);
+          
+          // Fallback: search all EOJs for inline enum definitions
+          if (!rawData && mraCache) {
+            for (const [otherEojKey, otherLookup] of mraCache.entries()) {
+              const otherRaw = getRawMraPropertyData(epcNum, otherEojKey);
+              if (otherRaw && otherRaw.type === 'state' && otherRaw.enum && otherRaw.enum.length > 0) {
+                rawData = otherRaw;
+                break;
+              }
+            }
+          }
+
+          if (rawData) {
+            let resolvedDef: any = null;
+            if (rawData?.$ref) {
+              resolvedDef = resolveRef(rawData.$ref);
+            }
+
+            const propertyType = rawData?.type || resolvedDef?.type;
+            let values: any = undefined;
+
+            if (propertyType === 'state') {
+              const enumData = rawData?.enum || resolvedDef?.enum;
+              if (enumData) {
+                values = enumData.map((e: any) => ({
+                  hex: `0x${parseInt(e.edt).toString(16).toUpperCase()}`,
+                  name: e.descriptions?.en || e.name,
+                }));
+              }
+            } else if (propertyType === 'number' && resolvedDef) {
+              const unit = resolvedDef.unit ? ` ${resolvedDef.unit}` : '';
+              values = `${resolvedDef.minimum ?? 0}-${resolvedDef.maximum ?? '?'}${unit} (${resolvedDef.format || 'unknown'})`;
+            } else if (propertyType === 'level' && resolvedDef) {
+              const base = parseInt(resolvedDef.base, 16);
+              const maxLevel = resolvedDef.maximum;
+              values = `${base.toString(16).toUpperCase()}-${(base + maxLevel - 1).toString(16).toUpperCase()} (${maxLevel} levels, base=${resolvedDef.base})`;
+            } else if (rawData?.oneOf) {
+              values = rawData.oneOf.map((option: any) => {
+                if (option?.$ref) {
+                  const optResolved = resolveRef(option.$ref);
+                  if (optResolved?.type === 'state' && optResolved?.enum) {
+                    return { hex: `0x${parseInt(optResolved.enum[0]?.edt || '0', 16).toString(16).toUpperCase()}`, name: optResolved.enum[0]?.descriptions?.en || option.$ref };
+                  } else if (optResolved?.type === 'number') {
+                    const unit = optResolved.unit ? ` ${optResolved.unit}` : '';
+                    return `${optResolved.minimum ?? 0}-${optResolved.maximum ?? '?'}${unit} (${optResolved.format || 'unknown'})`;
+                  } else if (optResolved?.type === 'level') {
+                    const base = parseInt(optResolved.base, 16);
+                    const maxLevel = optResolved.maximum;
+                    return `${base.toString(16).toUpperCase()}-${(base + maxLevel - 1).toString(16).toUpperCase()} (${maxLevel} levels)`;
+                  }
+                } else if (option?.type === 'state' && option?.enum) {
+                  const e = option.enum[0];
+                  return { hex: `0x${parseInt(e.edt || '0', 16).toString(16).toUpperCase()}`, name: e.descriptions?.en || e.name };
+                }
+                return null;
+              }).filter((v: any) => v !== null);
+            }
+
+            if (values !== undefined && values.length > 0) {
+              baseProp.values = values;
+            }
+          }
+        }
+
+        return baseProp;
+      };
+
+      // Enrich parsed entries with MRA data
+      const statmapEntries = (result.get(0x9d) || []).map(e => enrichParsedEntry(e, false));
+      const setmapEntries = (result.get(0x9e) || []).map(e => enrichParsedEntry(e, true));
+      const getmapEntries = (result.get(0x9f) || []).map(e => enrichParsedEntry(e, false));
 
       return {
         content: [{ type: 'text', text: JSON.stringify({ 
